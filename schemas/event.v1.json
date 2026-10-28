@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://minecraft-agent.invalid/schemas/event.v1.json",
+  "title": "Append-only run event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version","run_id","world_id","sequence","wall_time","elapsed_seconds","type","payload"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type":"string"},
+    "world_id": {"type":"string"},
+    "sequence": {"type":"integer","minimum":1},
+    "wall_time": {"type":"string","format":"date-time"},
+    "elapsed_seconds": {"type":"number","minimum":0},
+    "type": {"type":"string","minLength":1},
+    "causal_id": {"type":["string","null"]},
+    "payload": {"type":"object"}
+  }
+}

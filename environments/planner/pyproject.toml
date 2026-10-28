@@ -1,0 +1,38 @@
+[project]
+name = "minecraft-agent-nemotron-runtime"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "vllm==0.32.0",
+  "minecraft-agent-harness",
+  "ninja>=1.11,<2",
+  "flashinfer-cubin==0.7.0.post1",
+  "flashinfer-jit-cache==0.7.0.post1+cu130",
+]
+
+[[tool.uv.index]]
+name = "flashinfer-cubin"
+url = "https://flashinfer.ai/whl/"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130/"
+
+[tool.uv.sources]
+minecraft-agent-harness = { path = "../..", editable = true }
+flashinfer-cubin = { index = "flashinfer-cubin" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+exclude-dependencies = [
+  "flashinfer-jit-cache-sm110a",
+  "flashinfer-jit-cache-sm121a",
+]

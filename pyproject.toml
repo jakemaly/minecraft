@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=75,<76"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minecraft-agent-harness"
+version = "0.1.0"
+description = "Explicit-control marimo harness for local Minecraft agent experiments"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+notebook = ["marimo==0.23.11", "anywidget==0.9.21", "huggingface-hub==1.7.1", "boto3==1.42.32"]
+storage = [
+  "huggingface-hub==1.7.1",
+  "boto3==1.42.32",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
