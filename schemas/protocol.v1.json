@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://minecraft-agent.invalid/schemas/protocol.v1.json",
+  "title": "Minecraft Agent RPC envelope",
+  "oneOf": [
+    {"type":"object","additionalProperties":false,"required":["version","run_id","request_id","method","params"],"properties":{"version":{"const":1},"run_id":{"type":"string","minLength":1,"maxLength":128},"request_id":{"type":"string","minLength":1,"maxLength":128},"method":{"type":"string","enum":["observe","execute","viewer_snapshot","stop"]},"params":{"type":"object"}}},
+    {"type":"object","additionalProperties":false,"required":["version","run_id","request_id","method","params"],"properties":{"version":{"const":1},"run_id":{"type":"string","minLength":1,"maxLength":128},"request_id":{"type":"string","minLength":1,"maxLength":128},"method":{"type":"string","enum":["observe","execute","viewer_snapshot","stop"]},"params":{"type":"object"}}},
+    {"type":"object","additionalProperties":false,"required":["version","request_id","result"],"properties":{"version":{"const":1},"request_id":{"type":["string","null"]},"result":{}}},
+    {"type":"object","additionalProperties":false,"required":["version","request_id","error"],"properties":{"version":{"const":1},"request_id":{"type":["string","null"]},"error":{"type":"object","additionalProperties":false,"required":["code","message"],"properties":{"code":{"type":"string"},"message":{"type":"string","maxLength":500}}}}}
+  ]
+}

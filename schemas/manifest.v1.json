@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://minecraft-agent.invalid/schemas/manifest.v1.json",
+  "title": "Run manifest",
+  "type": "object",
+  "required": ["schema_version","run_id","world_id","created_at","config","preflight","models","game","dependencies","observation_policy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type":"string"},
+    "world_id": {"type":"string"},
+    "created_at": {"type":"string","format":"date-time"},
+    "config": {"type":"object"},
+    "preflight": {"type":"object"},
+    "models": {"type":"object","required":["planner","selector"],"properties":{"planner":{"type":"object"},"selector":{"type":"object"}}},
+    "game": {"type":"object"},
+    "dependencies": {"type":"object"},
+    "observation_policy": {"type":"object"},
+    "code_commit": {"type":["string","null"]},
+    "dirty_diff_sha256": {"type":["string","null"]}
+  }
+}
