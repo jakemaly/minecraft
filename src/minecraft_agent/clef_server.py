@@ -35,7 +35,7 @@ def serve(snapshot: str, host: str, port: int, device: str) -> None:
                 payload = json.loads(self.rfile.read(length))
                 candidates = [Candidate(**item) for item in payload["candidates"]]
                 scores = adapter.choose(payload["state"], payload["objective"], candidates)
-                self._json(200, {"scores": scores})
+                self._json(200, {"scores": scores, "metrics": getattr(adapter, "last_metrics", {"status": "unavailable"})})
             except Exception as exc:
                 self._json(400, {"error": type(exc).__name__, "message": str(exc)[:300]})
 

@@ -53,6 +53,7 @@ class Supervisor:
         self.processes: dict[str, ManagedProcess] = {}
         self._lock = threading.RLock()
         self._action_lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
         self._action_results: dict[str, dict] = {}
         self._cleaned_up = False
         atexit.register(self._cleanup_for_exit)
@@ -186,14 +187,24 @@ class Supervisor:
             managed.pump_thread.join(timeout=2)
         self._write_state()
 
+    def send_command(self, name: str, command: str) -> None:
+        """Send one console line to a managed process with piped standard input."""
+        if not isinstance(command, str) or not command.strip() or "\n" in command or "\r" in command:
+            raise ValueError("console command must be one non-empty line")
+        managed = self.processes.get(name)
+        if managed is None or managed.process.poll() is not None or managed.process.stdin is None:
+            raise RuntimeError(f"{name} is not running with a command input")
+        with self._stdin_lock:
+            managed.process.stdin.write((command.strip() + "\n").encode("utf-8"))
+            managed.process.stdin.flush()
+
     def stop_minecraft_server(self, grace_seconds: float = 45) -> None:
         """Flush the world and ask vanilla to stop before falling back to signals."""
         managed = self.processes.get("minecraft-server")
         if managed is None or managed.process.poll() is not None:
             return
-        if managed.process.stdin is not None:
-            managed.process.stdin.write(b"save-all flush\nstop\n")
-            managed.process.stdin.flush()
+        self.send_command("minecraft-server", "save-all flush")
+        self.send_command("minecraft-server", "stop")
         try:
             managed.process.wait(timeout=grace_seconds)
             managed.log.close()

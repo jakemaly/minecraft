@@ -1,9 +1,11 @@
-"""Install and run a private, loopback-only vanilla Java server."""
+"""Install and run a private vanilla Java server on a selected interface."""
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import secrets
 import subprocess
 import urllib.request
 from pathlib import Path
@@ -39,18 +41,33 @@ def download_server(version: str, directory: str | Path) -> Path:
     return jar
 
 
-def prepare_server(directory: str | Path) -> None:
+def prepare_server(
+    directory: str | Path,
+    *,
+    seed: str | int | None = None,
+    bind_address: str = "127.0.0.1",
+    port: int = 25565,
+    default_gamemode: str = "spectator",
+) -> None:
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    ipaddress.ip_address(bind_address)
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("server port must be between 1 and 65535")
+    if default_gamemode not in {"survival", "spectator"}:
+        raise ValueError("default_gamemode must be survival or spectator")
+    if seed is None:
+        seed = secrets.randbits(63)
     # The operator explicitly authorized continuing past the EULA gate for this private practice run.
     (root / "eula.txt").write_text("eula=true\n", encoding="utf-8")
     properties = {
-        "server-ip": "127.0.0.1", "server-port": "25565", "online-mode": "false",
-        "difficulty": "normal", "gamemode": "survival", "level-type": "minecraft:normal",
+        "server-ip": bind_address, "server-port": str(port), "online-mode": "false",
+        "difficulty": "normal", "gamemode": default_gamemode, "level-type": "minecraft:normal",
+        "level-seed": str(seed),
         "allow-nether": "true", "enable-command-block": "false", "enable-rcon": "false",
         "enable-query": "false", "enable-status": "true", "spawn-protection": "0",
         "max-players": "2", "view-distance": "6", "simulation-distance": "4",
-        "motd": "Private agent smoke world", "white-list": "false",
+        "motd": "Private Minecraft agent trial", "white-list": "false",
     }
     (root / "server.properties").write_text("".join(f"{key}={value}\n" for key, value in properties.items()), encoding="utf-8")
 
@@ -66,6 +83,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", default="1.21.4")
     parser.add_argument("--directory", required=True)
+    parser.add_argument("--bind-address", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=25565)
+    parser.add_argument("--seed")
+    parser.add_argument("--default-gamemode", choices=("survival", "spectator"), default="spectator")
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--prepare", action="store_true")
     args = parser.parse_args()
@@ -73,7 +94,7 @@ def main() -> None:
     if args.download:
         print(download_server(args.version, root))
     if args.prepare:
-        prepare_server(root)
+        prepare_server(root, seed=args.seed, bind_address=args.bind_address, port=args.port, default_gamemode=args.default_gamemode)
 
 
 if __name__ == "__main__":

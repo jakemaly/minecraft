@@ -133,6 +133,8 @@ def resource_sample(pids: list[int] | None = None) -> dict[str, Any]:
 def summarize_resource_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     rss_peaks: dict[str, int] = {}
     gpu_peaks = []
+    gpu_utilization = []
+    gpu_sample_errors = 0
     for sample in samples:
         for pid, record in sample.get("processes", {}).items():
             value = record.get("rss_bytes")
@@ -141,10 +143,21 @@ def summarize_resource_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         output = sample.get("gpu", {}).get("output", "")
         for line in output.splitlines():
             try:
-                gpu_peaks.append(int(line.split(",", 1)[0].strip()))
+                columns = [column.strip() for column in line.split(",")]
+                gpu_peaks.append(int(columns[0]))
+                if len(columns) > 2:
+                    gpu_utilization.append(int(columns[2].split()[0]))
             except ValueError:
-                continue
-    return {"sample_count": len(samples), "process_rss_peak_bytes": rss_peaks, "gpu_memory_used_peak_bytes": max(gpu_peaks) * 1024 * 1024 if gpu_peaks else None}
+                gpu_sample_errors += 1
+    return {
+        "sample_count": len(samples),
+        "process_rss_peak_bytes": rss_peaks,
+        "gpu_memory_used_peak_bytes": max(gpu_peaks) * 1024 * 1024 if gpu_peaks else None,
+        "gpu_utilization_sample_mean_percent": sum(gpu_utilization) / len(gpu_utilization) if gpu_utilization else None,
+        "gpu_utilization_peak_percent": max(gpu_utilization) if gpu_utilization else None,
+        "gpu_metric_samples": len(gpu_utilization),
+        "gpu_metric_parse_errors": gpu_sample_errors,
+    }
 
 
 class ResourceSampler:

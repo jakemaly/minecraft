@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -17,7 +18,18 @@ from minecraft_agent.events import EventLog
 from minecraft_agent.models.interfaces import Candidate, Proposal, validate_probabilities, validate_proposal
 from minecraft_agent.persistence import compare_player_state, create_snapshot, restore_snapshot, verify_snapshot
 from minecraft_agent.protocol import ProtocolError, decode_line, encode_request
+from minecraft_agent.session import NotebookSession
 from minecraft_agent.supervisor import RunState, Supervisor
+
+
+class SessionButtonTests(unittest.TestCase):
+    def test_boolean_run_button_pulses_can_be_claimed_repeatedly(self):
+        session = NotebookSession()
+        with patch("minecraft_agent.session.time.monotonic", side_effect=[10.0, 10.5, 12.0]):
+            self.assertTrue(session.claim_button("start", True))
+            self.assertFalse(session.claim_button("start", True))
+            self.assertFalse(session.claim_button("start", False))
+            self.assertTrue(session.claim_button("start", True))
 
 
 class ProtocolTests(unittest.TestCase):
@@ -60,6 +72,52 @@ class ModelContractTests(unittest.TestCase):
         too_large = Proposal("safe", "ok", (Candidate("helper", "Run", "helper", {"source": "x" * 33000}), Candidate("replan", "Stop", "replan", {})), "{}")
         with self.assertRaises(ValueError):
             validate_proposal(too_large)
+
+    def test_helper_source_allowlist_supports_nested_action_payloads(self):
+        from minecraft_agent.models.local_nemotron import LocalNemotron
+
+        dig = 'await api.act({"type":"dig","position":{"x":1,"y":64,"z":2}});'
+        craft = 'await api.act({"type":"craft","item":"crafting_table","count":1});'
+        objective = f"Choose one helper. <HELPER_SOURCE>{dig}</HELPER_SOURCE> <HELPER_SOURCE>{craft}</HELPER_SOURCE>"
+        self.assertEqual(LocalNemotron.exact_helper_sources(objective), [dig, craft])
+
+    def test_helper_prompt_is_compact_and_has_one_exact_candidate(self):
+        from minecraft_agent.models.local_nemotron import LocalNemotron
+
+        source = 'await api.act({"type":"move","duration_ms":500});'
+        objective = f"Use the exact helper source. <HELPER_SOURCE>{source}</HELPER_SOURCE>"
+        response_body = {
+            "choices": [{"message": {"content": json.dumps({
+                "objective": "Move toward the tree",
+                "rationale": "The next bounded move advances the task.",
+                "candidates": [{"candidate_id": "move", "description": "Move forward", "kind": "helper", "payload": {"source": source}}],
+            })}}]
+        }
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return json.dumps(response_body).encode()
+
+        def fake_urlopen(request, timeout):
+            payload = json.loads(request.data)
+            self.assertEqual(payload["max_tokens"], 256)
+            schema = payload["response_format"]["json_schema"]["schema"]
+            self.assertEqual(schema["properties"]["candidates"]["minItems"], 1)
+            self.assertEqual(schema["properties"]["candidates"]["maxItems"], 1)
+            prompt = json.loads(payload["messages"][0]["content"])
+            self.assertEqual(prompt["observation"]["recent_events"], [])
+            return Response()
+
+        observation = {"recent_events": [{"message": "irrelevant history"}] * 12, "player": {"health": 20}}
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            proposal = LocalNemotron("http://127.0.0.1:8000/v1", "test-model").propose(observation, objective)
+        self.assertEqual([candidate.kind for candidate in proposal.candidates], ["helper", "replan"])
 
 
 class AgentStepTests(unittest.TestCase):
@@ -106,6 +164,59 @@ class AgentStepTests(unittest.TestCase):
             self.assertEqual(len(helper.calls), 1)
             self.assertEqual(bot.executed, [])
 
+
+class CapabilityServerTests(unittest.TestCase):
+    def test_helper_actions_request_an_ack_without_a_second_observation(self):
+        from minecraft_agent.helper import CapabilityServer
+
+        class Bot:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, params):
+                self.calls.append((method, params))
+                return {"status": "completed", "controls_released": True}
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "capability.sock"
+            bot = Bot()
+            server = CapabilityServer(path, bot, allowed_action_types={"move"}, max_actions=1)
+            server.start()
+            try:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(1)
+                client.connect(str(path))
+                with client:
+                    stream = client.makefile("rwb")
+                    request = {"version": 1, "request_id": "1", "method": "execute", "params": {"action": {"type": "move", "keys": ["forward"], "duration_ms": 500}}}
+                    stream.write(json.dumps(request).encode() + b"\n")
+                    stream.flush()
+                    response = json.loads(stream.readline())
+                self.assertEqual(response["result"]["status"], "completed")
+                self.assertEqual(bot.calls[0][0], "execute")
+                self.assertIs(bot.calls[0][1]["include_observation"], False)
+            finally:
+                server.close()
+
+
+class WorkerCommandTests(unittest.TestCase):
+    def test_timeout_seconds_are_passed_to_node_as_milliseconds(self):
+        from minecraft_agent.sandbox import worker_command
+
+        with tempfile.TemporaryDirectory() as temp, patch("minecraft_agent.sandbox.shutil.which", return_value="/usr/bin/node"):
+            root = Path(temp)
+            helpers = root / "helpers"
+            helpers.mkdir()
+            wrapper = root / "worker.js"
+            wrapper.write_text("", encoding="utf-8")
+            socket_path = root / "runtime" / "capability.sock"
+            socket_path.parent.mkdir()
+            socket_path.touch()
+            command = worker_command(wrapper, helpers, socket_path, helper_filename="task.js", timeout_seconds=12)
+            self.assertEqual(command[2], "12000")
+            with self.assertRaisesRegex(ValueError, "between 1 and 30"):
+                worker_command(wrapper, helpers, socket_path, helper_filename="task.js", timeout_seconds=31)
+
     def test_required_helper_is_not_executed_if_selector_chooses_primitive(self):
         from minecraft_agent.agent import AgentStep
 
@@ -142,12 +253,20 @@ class EventTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "events.jsonl"
             log = EventLog(path, "run-1", "world-1")
-            first = log.append("probe", {"api_key": "secret", "nested": {"password": "hidden"}})
+            first = log.append("probe", {
+                "api_key": "secret", "access_token": "hidden",
+                "input_tokens": 120, "output_tokens": 35,
+                "nested": {"password": "hidden", "prompt_tokens": 100},
+            })
             second = EventLog(path, "run-1", "world-1").append("next", {})
             rows = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual([row["sequence"] for row in rows], [1, 2])
             self.assertEqual(first["payload"]["api_key"], "[REDACTED]")
+            self.assertEqual(first["payload"]["access_token"], "[REDACTED]")
+            self.assertEqual(first["payload"]["input_tokens"], 120)
+            self.assertEqual(first["payload"]["output_tokens"], 35)
             self.assertEqual(rows[0]["payload"]["nested"]["password"], "[REDACTED]")
+            self.assertEqual(rows[0]["payload"]["nested"]["prompt_tokens"], 100)
             self.assertEqual(second["sequence"], 2)
 
     def test_resume_rejects_event_gap_and_wrong_world(self):
@@ -266,6 +385,25 @@ class PreflightGateTests(unittest.TestCase):
             self.assertEqual(result["repositories"]["selector"]["revision"], revisions["selector"])
             self.assertIsNone(result["gpu"])
 
+    def test_model_hydration_can_download_only_nemotron(self):
+        from minecraft_agent import model_storage
+        from types import SimpleNamespace
+        fake_api = SimpleNamespace(model_info=lambda repo_id, revision, files_metadata: SimpleNamespace(sha=revision, siblings=[SimpleNamespace(size=3)], cardData=SimpleNamespace(license="openmdw-1.1")))
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def download(repo_id, revision, cache_dir, token):
+                calls.append(repo_id)
+                root = Path(temp) / repo_id.replace("/", "--")
+                root.mkdir(); (root / "weights.bin").write_bytes(b"weights")
+                return str(root)
+
+            with patch("huggingface_hub.HfApi", return_value=fake_api), patch("huggingface_hub.snapshot_download", side_effect=download), patch.object(model_storage.shutil, "which", return_value=None):
+                report = model_storage.estimate_and_hydrate(Path(temp) / "cache", roles=("planner",))
+
+        self.assertEqual(calls, [model_storage.MODEL_REPOSITORIES["planner"]])
+        self.assertEqual(set(report["repositories"]), {"planner"})
+
     def test_server_preparation_records_operator_eula_override(self):
         from scripts.server import prepare_server
         with tempfile.TemporaryDirectory() as temp:
@@ -306,6 +444,64 @@ class ConfigTests(unittest.TestCase):
             RunConfig(profile="unknown").validate()
         with self.assertRaises(ValueError):
             RunConfig(max_observation_bytes=100, max_rpc_bytes=50).validate()
+
+
+class ModelRuntimeTests(unittest.TestCase):
+    def test_cuda_environment_prefers_project_toolchain_over_host_nvcc(self):
+        from minecraft_agent import model_runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            nvcc = project / ".venv/lib/python3.13/site-packages/nvidia/cu13/bin/nvcc"
+            nvcc.parent.mkdir(parents=True)
+            nvcc.write_text("", encoding="utf-8")
+            cuda_root = nvcc.parent.parent
+            (cuda_root / "lib").mkdir()
+            (cuda_root / "lib/libcudart.so.13.0.96").write_text("", encoding="utf-8")
+            home = project / "home"
+            with patch.dict(os.environ, {"PATH": "/usr/bin", "LIBRARY_PATH": "", "LD_LIBRARY_PATH": ""}), \
+                 patch.object(model_runtime.Path, "home", return_value=home):
+                env = model_runtime._cuda_link_environment(project)
+
+            self.assertEqual(env["CUDA_HOME"], str(cuda_root))
+            self.assertTrue(env["PATH"].startswith(str(nvcc.parent)))
+            self.assertIn(str(cuda_root / "lib"), env["LD_LIBRARY_PATH"])
+
+    def test_nemotron_runs_alone_with_1m_context_and_long_context_cache_settings(self):
+        from minecraft_agent import model_runtime
+
+        class Supervisor:
+            run_id = "run-1m"
+
+            def __init__(self):
+                self.started = []
+
+            def start(self, *args, **kwargs):
+                self.started.append((args, kwargs))
+                return "started"
+
+        supervisor = Supervisor()
+        hydration = {"repositories": {"planner": {"snapshot_path": "/models/nemotron", "repo_id": "pinned-nemotron"}}}
+        with patch.object(model_runtime, "_hydration", return_value=hydration), \
+             patch.object(model_runtime, "repo_root", return_value=Path("/repo")), \
+             patch.object(model_runtime.shutil, "which", return_value="/usr/bin/uv"), \
+             patch.object(model_runtime, "_cuda_link_environment", return_value={}):
+            self.assertEqual(model_runtime.start_nemotron(supervisor, "/run/dir"), "started")
+
+        self.assertEqual(len(supervisor.started), 1)
+        args, kwargs = supervisor.started[0]
+        self.assertEqual(args[0], "nemotron")
+        command = args[1]
+        self.assertEqual(command[command.index("--max-model-len") + 1], "1048576")
+        self.assertEqual(command[command.index("--max-num-seqs") + 1], "1")
+        self.assertEqual(command[command.index("--max-num-batched-tokens") + 1], "8192")
+        self.assertEqual(command[command.index("--gpu-memory-utilization") + 1], "0.82")
+        self.assertEqual(command[command.index("--mamba-ssm-cache-dtype") + 1], "float16")
+        self.assertEqual(command[command.index("--video-pruning-rate") + 1], "0.5")
+        self.assertIn('{"video":{"fps":2,"num_frames":256}}', command)
+        self.assertIn("--enable-prefix-caching", command)
+        self.assertNotIn("clef", command)
+        self.assertEqual(kwargs["timeout"], 1800)
 
 
 if __name__ == "__main__":

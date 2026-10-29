@@ -56,6 +56,7 @@ class ClefReleaseAdapter:
         self.device = device
 
     def choose(self, state: dict[str, Any], objective: str, candidates: list[Candidate]) -> dict[str, float]:
+        started = time.monotonic()
         if not candidates:
             raise ValueError("selector needs at least one candidate")
         question = {"type": "choice", "instructions": f"Choose an available action for the objective: {objective}", "criteria": {item.candidate_id: item.description for item in candidates}}
@@ -74,6 +75,20 @@ class ClefReleaseAdapter:
         probabilities = torch.softmax(logits[0].float(), dim=-1).detach().cpu().tolist()
         scores = {candidate_id: float(value) for candidate_id, value in zip(option_ids, probabilities, strict=True)}
         validate_probabilities(scores, [candidate.candidate_id for candidate in candidates], tolerance=1e-4)
+        input_ids = batch.get("input_ids") if isinstance(batch, dict) else None
+        self.last_metrics = {
+            "status": "ok",
+            "input_tokens": int(input_ids.numel()) if input_ids is not None and hasattr(input_ids, "numel") else None,
+            "output_tokens": 0,
+            "latency_seconds": time.monotonic() - started,
+            "ttft_seconds": None,
+            "output_tokens_per_second": None,
+            "reasoning_trace": "not_exposed_by_typed_choice_head",
+            "final_answer": "not_applicable_typed_choice_scores",
+            "kv_cache": "not_used_by_selector",
+            "cost_usd": None,
+            "cost_status": "unavailable_local_inference",
+        }
         return scores
 
 
@@ -100,6 +115,14 @@ class LocalClefClient:
         scores = body.get("scores")
         validate_probabilities(scores, [item.candidate_id for item in candidates])
         self.last_latency_seconds = time.monotonic() - started
+        remote_metrics = body.get("metrics")
+        self.last_metrics = {
+            **(remote_metrics if isinstance(remote_metrics, dict) else {}),
+            "status": "ok" if isinstance(remote_metrics, dict) else "unavailable",
+            "request_latency_seconds": self.last_latency_seconds,
+            "cost_usd": None,
+            "cost_status": "unavailable_local_inference",
+        }
         return scores
 
 

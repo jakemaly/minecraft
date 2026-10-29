@@ -1,0 +1,15 @@
+// Merge this grant and these hosts into the existing tailnet policy.
+// These are the stable addresses currently reported by `tailscale status`.
+{
+  "hosts": {
+    "minecraft-linux": "100.83.98.53",
+    "minecraft-mac": "100.125.162.22"
+  },
+  "grants": [
+    {
+      "src": ["minecraft-mac"],
+      "dst": ["minecraft-linux"],
+      "ip": ["tcp:2718", "tcp:3000", "tcp:25565"]
+    }
+  ]
+}

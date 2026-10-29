@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-notebook = ["marimo==0.23.11", "anywidget==0.9.21", "huggingface-hub==1.7.1", "boto3==1.42.32"]
+notebook = ["marimo==0.23.11", "anywidget==0.9.21", "huggingface-hub==1.7.1", "boto3==1.42.32", "pillow==12.3.0"]
 storage = [
   "huggingface-hub==1.7.1",
   "boto3==1.42.32",

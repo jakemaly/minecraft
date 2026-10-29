@@ -10,11 +10,15 @@ from typing import Any
 
 SOURCE_PATHS = (
     "src/minecraft_agent",
-    "notebooks/01_agent_runtime.py",
+    "notebooks",
     "bridge/src",
+    "bridge/scripts",
+    "bridge/test",
     "scripts",
     "schemas",
     "viewer",
+    "deploy",
+    "tests",
     "pyproject.toml",
     "uv.lock",
     "environments/planner/pyproject.toml",
