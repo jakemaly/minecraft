@@ -20,10 +20,18 @@ MODEL_REVISIONS = {
 }
 
 
-def estimate_and_hydrate(cache_dir: str | Path, *, reserve_fraction: float = 0.20) -> dict[str, Any]:
+def estimate_and_hydrate(
+    cache_dir: str | Path,
+    *,
+    reserve_fraction: float = 0.20,
+    roles: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Download the selected immutable public snapshots and record their local hashes."""
     if not 0.05 <= reserve_fraction <= 0.5:
         raise ValueError("reserve_fraction must be between 5% and 50%")
+    selected_roles = tuple(MODEL_REPOSITORIES) if roles is None else tuple(roles)
+    if not selected_roles or any(role not in MODEL_REPOSITORIES for role in selected_roles):
+        raise ValueError("roles must select one or more configured model roles")
     usage = shutil.disk_usage(Path(cache_dir).parent if Path(cache_dir).parent.exists() else Path.home())
     gpu = None
     if shutil.which("nvidia-smi"):
@@ -38,7 +46,8 @@ def estimate_and_hydrate(cache_dir: str | Path, *, reserve_fraction: float = 0.2
     api = HfApi(token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"))
     resolved = {}
     total_bytes = 0
-    for role, repo_id in MODEL_REPOSITORIES.items():
+    for role in selected_roles:
+        repo_id = MODEL_REPOSITORIES[role]
         info = api.model_info(repo_id=repo_id, revision=MODEL_REVISIONS[role], files_metadata=True)
         sizes = [item.size for item in (info.siblings or []) if item.size is not None]
         size = sum(sizes)

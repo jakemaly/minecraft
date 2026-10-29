@@ -1,8 +1,8 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["marimo==0.23.11", "anywidget==0.9.21", "huggingface-hub==1.7.1", "boto3==1.42.32"]
+# dependencies = ["marimo==0.23.11"]
 # ///
-"""Explicit-control dashboard for local Nemotron, Clef-Flash, and Mineflayer."""
+"""Thin Marimo control panel for the persistent Pi/Mineflayer Linux service."""
 
 import marimo
 
@@ -12,833 +12,332 @@ app = marimo.App(width="full")
 
 @app.cell
 def _():
-    import os
+    import html
+    import json
+    import marimo as mo
     import sys
     from pathlib import Path
-    import marimo as mo
 
-    _repo = Path(__file__).resolve().parents[1]
-    for _path in (str(_repo), str(_repo / "src")):
-        if _path not in sys.path:
-            sys.path.insert(0, _path)
-    from minecraft_agent.config import RunConfig, runtime_root
-    from minecraft_agent.preflight import inspect
+    repo_root = Path(__file__).resolve().parents[1]
+    _source = str(repo_root / "src")
+    if _source not in sys.path:
+        sys.path.insert(0, _source)
+    from minecraft_agent.daemon_client import ensure_daemon, request
     from minecraft_agent.session import get_session
 
     session = get_session()
-    config = RunConfig.from_environment()
-    config.validate()
-    return config, inspect, mo, os, runtime_root, session, _repo
+    try:
+        ensure_daemon(repo_root)
+        startup_error = None
+    except Exception as exc:
+        startup_error = f"{type(exc).__name__}: {str(exc)[:500]}"
 
-
-@app.cell
-def _(inspect, mo):
-    _environment = inspect()
-    mo.vstack([mo.md("# Minecraft agent runtime\n\nRead-only preflight. Side effects require their dedicated buttons below. Secret values are never displayed."), mo.json(_environment)])
-    return (_environment,)
+    return Path, html, json, mo, request, session, startup_error
 
 
 @app.cell
 def _(mo):
-    create_run_button = mo.ui.run_button(label="Create run workspace")
-    isolation_button = mo.ui.run_button(label="Measure generated-code isolation (informational)")
-    install_bridge_button = mo.ui.run_button(label="Install locked Mineflayer dependencies")
-    install_env_button = mo.ui.run_button(label="Install locked model environments")
-    hydrate_button = mo.ui.run_button(label="Download pinned model snapshots")
-    individual_probe_button = mo.ui.run_button(label="Probe each model alone")
-    combined_start_button = mo.ui.run_button(label="Start both models together")
-    combined_probe_button = mo.ui.run_button(label="Run alternating co-residency probe")
-    stop_models_button = mo.ui.run_button(label="Stop model processes")
-    download_server_button = mo.ui.run_button(label="Download pinned vanilla server")
-    prepare_server_button = mo.ui.run_button(label="Prepare loopback server")
-    start_server_button = mo.ui.run_button(label="Start private server")
-    connect_bot_button = mo.ui.run_button(label="Connect Mineflayer")
-    observe_button = mo.ui.run_button(label="Refresh bounded observation")
-    action_button = mo.ui.run_button(label="Run bounded look smoke action")
-    viewer_button = mo.ui.run_button(label="Refresh observer view")
-    practice_button = mo.ui.run_button(label="Run two-model practice smoke turn")
-    stop_button = mo.ui.run_button(label="Pause and stop active processes")
-    evidence_export_button = mo.ui.run_button(label="Export verified practice evidence")
-    checkpoint_button = mo.ui.run_button(label="Create and verify local checkpoint")
-    storage_probe_button = mo.ui.run_button(label="Check optional remote storage")
-    upload_button = mo.ui.run_button(label="Export checkpoint (remote storage optional)")
-    restore_button = mo.ui.run_button(label="Download and verify remote checkpoint")
-    resume_button = mo.ui.run_button(label="Resume restored world")
-    mo.vstack([
-        mo.md("## Controls\n\nEach button action is consumed once, even when a reactive descendant reruns."),
-        create_run_button, isolation_button, install_bridge_button, install_env_button, hydrate_button,
-        individual_probe_button, combined_start_button, combined_probe_button, stop_models_button,
-        download_server_button, prepare_server_button, start_server_button,
-        connect_bot_button, observe_button, action_button, viewer_button,
-        practice_button, stop_button, evidence_export_button, checkpoint_button, storage_probe_button, upload_button, restore_button, resume_button,
+    callback = mo.ui.text(label="OAuth callback URL (only if localhost did not complete)", placeholder="http://127.0.0.1:1455/auth/callback?code=…&state=…", full_width=True)
+    connect = mo.ui.run_button(label="Connect with ChatGPT")
+    submit_callback = mo.ui.run_button(label="Submit callback URL")
+    run_kind = mo.ui.dropdown(options=["diamond_pilot", "dragon_proof"], value="diamond_pilot", label="Fresh Normal Survival trial")
+    start = mo.ui.run_button(label="Start fresh world and agent")
+    pause = mo.ui.run_button(label="Pause, release controls, freeze and save")
+    resume = mo.ui.run_button(label="Resume same world and workspace")
+    stop = mo.ui.run_button(label="Stop and save run")
+    observer = mo.ui.text(label="Mac Minecraft username", placeholder="Your Java profile name")
+    set_observer = mo.ui.run_button(label="Set joined observer to spectator")
+    export = mo.ui.run_button(label="Export run trace, world and video")
+    refresh = mo.ui.refresh(options=[5, 15], default_interval=5, label="Refresh status")
+
+    return callback, connect, export, observer, pause, refresh, resume, run_kind, set_observer, start, stop, submit_callback
+
+
+@app.cell
+def _(callback, connect, export, observer, pause, refresh, request, resume, run_kind, session, set_observer, start, startup_error, stop, submit_callback):
+    results = []
+
+    def once(name, button, method, params=None, timeout=30):
+        if session.claim_button(name, button.value):
+            try:
+                value = request(method, params or {}, timeout=timeout)
+                results.append({"action": name, "result": value})
+                return value
+            except Exception as error:
+                results.append({"action": name, "error": f"{type(error).__name__}: {str(error)[:500]}"})
+        return None
+
+    once("connect_chatgpt", connect, "auth_start")
+    once("oauth_callback", submit_callback, "auth_callback", {"url": callback.value}, 60)
+    once("start_run", start, "start_run", {"kind": run_kind.value})
+    once("pause_run", pause, "pause_run", timeout=30)
+    once("resume_run", resume, "resume_run", timeout=30)
+    once("stop_run", stop, "stop_run", timeout=90)
+    once("set_observer", set_observer, "set_observer", {"username": observer.value})
+    artifact = once("export_run", export, "export_run", timeout=120)
+    refresh_counter = refresh.value
+
+    try:
+        status = request("status", timeout=20)
+        status_error = None
+    except Exception as exc:
+        status = {}
+        status_error = f"{type(exc).__name__}: {str(exc)[:500]}"
+
+    return artifact, refresh_counter, results, startup_error, status, status_error
+
+
+@app.cell
+def _(mo, session, status):
+    active_for_requests = status.get("active_run") or {}
+    contexts = [event for event in (active_for_requests.get("recent_events") or []) if event.get("type") == "model_context"]
+    request_choices = {
+        f"#{event.get('sequence', '?')} · {(event.get('payload') or {}).get('model', 'model')} · {str((event.get('payload') or {}).get('request_id', ''))[-8:]}": (event.get("payload") or {}).get("request_id")
+        for event in contexts
+    }
+    picker_default_label = next((label for label, request_id in request_choices.items() if request_id == session.reports.get("observability_request_id")), None)
+    picker_default_label = picker_default_label or (next(reversed(request_choices)) if request_choices else None)
+    request_picker = mo.ui.dropdown(options=list(request_choices), value=picker_default_label, label="Inspect a model request") if request_choices else None
+
+    return request_choices, request_picker
+
+
+@app.cell
+def _(Path, artifact, callback, connect, export, html, json, mo, observer, pause, refresh, refresh_counter, request_choices, request_picker, results, resume, run_kind, session, set_observer, start, startup_error, status, status_error, stop, submit_callback):
+    import base64
+
+    auth = status.get("chatgpt_auth") or {}
+    active = status.get("active_run") or {}
+    events = active.get("recent_events") or []
+    authorization_url = auth.get("authorization_url")
+    auth_panel = mo.md("ChatGPT subscription: **connected**" if auth.get("connected") else "ChatGPT subscription: **not connected**")
+    if authorization_url:
+        auth_panel = mo.vstack([
+            auth_panel,
+            mo.Html(f'<p><a href="{html.escape(authorization_url, quote=True)}" target="_blank" rel="noopener">Continue with ChatGPT</a></p>'),
+            mo.md("If the browser returns to a localhost address on your Mac and cannot connect, copy that full address into the callback field above. The callback URL is used only for sign-in and is not recorded in run traces."),
+            callback,
+            submit_callback,
+        ])
+    elif not auth.get("connected"):
+        auth_details = []
+        if auth.get("login_in_progress"):
+            auth_details.append(mo.md(f"ChatGPT sign-in is starting. {html.escape(str(auth.get('progress') or 'Waiting for the provider.'))}"))
+        if auth.get("error"):
+            auth_details.append(mo.md(f"Sign-in error: `{html.escape(str(auth['error']))}`"))
+        auth_details.extend([connect, mo.md("This uses Pi’s OpenAI Sign in with ChatGPT OAuth provider. API-key billing fallback is disabled.")])
+        auth_panel = mo.vstack([auth_panel, *auth_details])
+    else:
+        catalog = auth.get("account_model_catalog") or {}
+        model = catalog.get("chosen") or status.get("selected_model")
+        if model:
+            model_label = "Pinned default model" if catalog.get("default_model_pinned") else "Selected account model"
+            pinned_note = mo.md("This model is saved as the default for future runs.") if catalog.get("default_model_pinned") else None
+            candidates = catalog.get("candidates", [])
+            candidate_rows = "".join(
+                f"<li><code>{html.escape(str(candidate.get('id', 'unknown')))}</code> · "
+                f"{html.escape(str(candidate.get('display_name') or candidate.get('name') or ''))} · "
+                f"{int(candidate.get('context_window') or 0):,}-token window · "
+                f"{'image' if candidate.get('image_input') else 'no image'} · "
+                f"{'reasoning' if candidate.get('reasoning') else 'no reasoning'}</li>"
+                for candidate in candidates
+            )
+            candidate_panel = mo.Html(
+                f'<details style="margin:8px 0"><summary>Available account models ({len(candidates)})</summary>'
+                f'<ul style="margin:8px 0;padding-left:24px;line-height:1.8">{candidate_rows}</ul></details>'
+            )
+            auth_panel = mo.vstack([
+                auth_panel,
+                mo.md(f"{model_label}: **{model.get('display_name') or model.get('id')}** (`{model.get('id')}`) · context `{model.get('context_window')}` · image input enabled"),
+                *([pinned_note] if catalog.get("default_model_pinned") else []),
+                mo.md(f"Pinned default: `{catalog.get('default_model_id')}` · {'yes' if catalog.get('default_model_pinned') else 'no'}") if catalog.get("default_model_id") else mo.md("No model default is pinned."),
+                mo.md(f"Pinned model unavailable: `{html.escape(str(catalog['pin_error']))}`") if catalog.get("pin_error") else candidate_panel,
+            ])
+        elif catalog.get("pin_error"):
+            auth_panel = mo.vstack([auth_panel, mo.md(f"Pinned model unavailable: `{html.escape(str(catalog['pin_error']))}`")])
+        if auth.get("error"):
+            auth_panel = mo.vstack([auth_panel, mo.md(f"Model catalog error: `{html.escape(str(auth['error']))}`"), connect])
+
+    controls = mo.vstack([
+        mo.md("## Run controls\n\nStarting a trial creates a fresh random-seed Normal Survival world, starts one Mineflayer control bot and the observer viewer, makes one image-plus-native-tool model probe, then starts the selected run. The world defaults all human players to spectator; the control bot is explicitly switched to Survival. The diamond pilot runs for up to four active hours; the dragon proof is capped at 72 active hours."),
+        mo.hstack([run_kind, start]),
+        mo.hstack([pause, resume, stop]),
+        mo.hstack([observer, set_observer]),
+        export,
     ])
-    return (create_run_button, isolation_button, install_bridge_button, install_env_button, hydrate_button,
-            individual_probe_button, combined_start_button, combined_probe_button, stop_models_button,
-            download_server_button, prepare_server_button, start_server_button,
-            connect_bot_button, observe_button, action_button, viewer_button,
-            practice_button, stop_button, evidence_export_button, checkpoint_button, storage_probe_button, upload_button, restore_button, resume_button)
 
+    live_states = {"probing_model", "running", "paused"}
+    viewer = None
+    if active.get("viewer_url") and active.get("state") in live_states:
+        viewer = mo.Html(f'<iframe title="Live first-person Prismarine Viewer" src="{html.escape(active["viewer_url"], quote=True)}" style="width:100%;height:560px;border:1px solid #ccc;border-radius:8px;background:#101820" loading="lazy" allow="fullscreen"></iframe>')
 
-@app.cell
-def _(create_run_button, inspect, mo, runtime_root, session, _repo):
-    def _run():
-        from datetime import datetime, timezone
-        import json
-        import uuid
-        from minecraft_agent.events import EventLog
-        from minecraft_agent.identity import source_identity
-        from minecraft_agent.supervisor import Supervisor
-
-        if session.claim_button("create_run", create_run_button.value):
-            if session.bridge and session.bridge.process.poll() is None:
-                session.reports["create_run"] = {"status": "blocked", "error": "stop the current Mineflayer connection before creating another run"}
-            elif session.supervisor and any(item.process.poll() is None for item in session.supervisor.processes.values()):
-                session.reports["create_run"] = {"status": "blocked", "error": "stop the current run before creating another"}
-            else:
-                # Keep prior-run measurements attached to their original world.
-                for _key in ("individual_model_probes", "combined_start", "combined_probe", "models_stop", "server_download", "server_prepare", "server_start", "bot_connect", "observation", "smoke_action", "viewer_snapshot", "viewer_widget", "practice", "operator_stop", "checkpoint", "checkpoint_observation", "checkpoint_upload", "checkpoint_restore", "restore_state_comparison", "resume", "evidence_export"):
-                    session.reports.pop(_key, None)
-                _run_id = "run-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
-                _world_id = "world-" + uuid.uuid4().hex[:12]
-                _preflight = inspect()
-                _run_dir = runtime_root() / "runs" / _run_id
-                _server_dir = runtime_root() / "worlds" / _run_id / "server"
-                _helper_dir = runtime_root() / "worlds" / _run_id / "agent" / "helpers"
-                _run_dir.mkdir(parents=True, exist_ok=False)
-                _helper_dir.mkdir(parents=True, exist_ok=False)
-                _identity = source_identity(_repo)
-                session.reports["active_server_dir"] = str(_server_dir)
-                session.reports["active_helper_dir"] = str(_helper_dir)
-                session.run_id = _run_id
-                session.supervisor = Supervisor(_run_dir, _run_id)
-                session.events = EventLog(_run_dir / "events" / "events.jsonl", _run_id, _world_id)
-                session.reports.pop("checkpoint_observation", None)
-                _manifest = {
-                    "schema_version": 1, "run_id": _run_id, "world_id": _world_id,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "config": __import__("minecraft_agent.config", fromlist=["RunConfig"]).RunConfig.from_environment().public_dict(),
-                    "preflight": _preflight,
-                    "models": {"planner": {"id": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4", "revision": "unresolved"}, "selector": {"id": "Cloudflare/clef-flash", "revision": "unresolved", "head": "joint_schema_model.py + joint_head.safetensors"}},
-                    "game": {"minecraft_version": "1.21.4", "mineflayer_version": "4.39.0", "mode": "private loopback offline-mode smoke server"},
-                    "dependencies": {**_identity, "lockfiles": ["uv.lock", "environments/planner/uv.lock", "environments/clef/uv.lock", "bridge/package-lock.json"]},
-                    "observation_policy": {"blocks": "Mineflayer loaded region; occlusion is not inferred", "human_viewer_excluded_from_models": True},
-                }
-                (_run_dir / "manifest.json").write_text(json.dumps(_manifest, indent=2) + "\n", encoding="utf-8")
-                session.events.append("run_created", {"manifest": _manifest})
-                session.reports["create_run"] = {"status": "created", "run_id": _run_id, "path": str(_run_dir)}
-        _report = session.reports.get("create_run", {"status": "waiting for explicit click"})
-        return mo.md(f"Run: **{_report.get('run_id', 'not created')}** · **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(mo, session, storage_probe_button):
-    def _run():
-        if session.claim_button("storage_probe", storage_probe_button.value):
-            try:
-                from minecraft_agent.persistence import probe_configured_storage
-                session.reports["storage_probe"] = probe_configured_storage()
-            except Exception as exc:
-                session.reports["storage_probe"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("storage_probe", session.reports["storage_probe"])
-        _report = session.reports.get("storage_probe", {"status": "waiting for explicit click"})
-        return mo.md(f"Optional remote storage: **{_report['status']}** · {_report.get('provider', _report.get('error', ''))}")
-    _run()
-
-
-@app.cell
-def _(install_bridge_button, inspect, mo, session, _repo):
-    def _run():
-        if session.claim_button("bridge_install", install_bridge_button.value):
-            try:
-                import json
-                import subprocess
-                import shutil
-                _host = inspect()
-                _node_text = _host["software"]["node"].get("output", "")
-                if not _node_text.startswith("v") or int(_node_text[1:].split(".")[0]) < 22:
-                    raise RuntimeError("Mineflayer 4.39.0 requires Node.js 22 or later")
-                _npm = shutil.which("npm")
-                if not _npm:
-                    raise RuntimeError("npm is unavailable")
-                _bridge = _repo / "bridge"
-                _install = subprocess.run([_npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=_bridge, capture_output=True, text=True, timeout=600, check=True)
-                _version = subprocess.run([_npm, "ls", "mineflayer", "--depth=0", "--json"], cwd=_bridge, capture_output=True, text=True, timeout=30, check=True)
-                _tree = json.loads(_version.stdout)
-                session.reports["bridge_install"] = {"status": "complete", "mineflayer": _tree["dependencies"]["mineflayer"]["version"], "node": _node_text, "lockfile": "bridge/package-lock.json", "install_output_tail": _install.stdout[-1000:]}
-            except Exception as exc:
-                session.reports["bridge_install"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("bridge_install", session.reports["bridge_install"])
-        _report = session.reports.get("bridge_install", {"status": "waiting for explicit click"})
-        return mo.md(f"Mineflayer dependencies: **{_report['status']}** · {_report.get('mineflayer', _report.get('error', ''))}")
-    _run()
-
-
-@app.cell
-def _(install_env_button, mo, session):
-    def _run():
-        if session.claim_button("model_env_install", install_env_button.value):
-            try:
-                from minecraft_agent.model_runtime import install_model_environments
-                session.reports["model_env_install"] = {"status": "complete", "environments": install_model_environments()}
-            except Exception as exc:
-                session.reports["model_env_install"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("model_env_install", session.reports["model_env_install"])
-        _report = session.reports.get("model_env_install", {"status": "waiting for explicit click"})
-        return mo.md(f"Model environments: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(hydrate_button, mo, runtime_root, session):
-    def _run():
-        if session.claim_button("model_hydration", hydrate_button.value):
-            try:
-                from minecraft_agent.model_storage import estimate_and_hydrate
-                session.reports["model_hydration"] = {"status": "complete", **estimate_and_hydrate(runtime_root() / "models-cache")}
-                if session.run_id:
-                    import json
-                    _manifest_path = session.supervisor.run_dir / "manifest.json"
-                    _manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
-                    for _role, _model in session.reports["model_hydration"]["repositories"].items():
-                        _manifest["models"][_role].update({"revision": _model["revision"], "license": _model.get("license"), "sha256": _model["sha256"]})
-                    _manifest_path.write_text(json.dumps(_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            except Exception as exc:
-                session.reports["model_hydration"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("model_hydration", {"status": session.reports["model_hydration"]["status"], "error": session.reports["model_hydration"].get("error")})
-        _report = session.reports.get("model_hydration", {"status": "waiting for explicit click"})
-        return mo.md(f"Model hydration: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(isolation_button, mo, session):
-    def _run():
-        if session.claim_button("isolation_probe", isolation_button.value):
-            from minecraft_agent.sandbox import probe
-            _probe = probe()
-            session.reports["isolation"] = {"available": _probe.available, "reason": _probe.reason}
-            if session.events:
-                session.events.append("isolation_probe", session.reports["isolation"])
-        _report = session.reports.get("isolation", {"available": False, "reason": "probe not run"})
-        return mo.md(f"Generated-code isolation (informational): **{'available' if _report['available'] else 'not enforced'}** · {_report['reason']} · helper execution proceeds under the operator-authorized direct worker mode.")
-    _run()
-
-
-@app.cell
-def _(individual_probe_button, mo, session):
-    def _run():
-        if session.claim_button("individual_model_probes", individual_probe_button.value):
-            _completed = {}
-            try:
-                if not session.supervisor:
-                    raise RuntimeError("create a run workspace first")
-                from minecraft_agent.model_runtime import start_clef, start_nemotron
-                from minecraft_agent.models.interfaces import Candidate
-                from minecraft_agent.models.local_clef import LocalClefClient
-                from minecraft_agent.models.local_nemotron import LocalNemotron
-                from minecraft_agent.preflight import ResourceSampler, summarize_resource_samples
-                import time
-
-                _planner_process = start_nemotron(session.supervisor, session.supervisor.run_dir)
-                _planner = LocalNemotron("http://127.0.0.1:8000/v1", "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4")
-                _sampler = ResourceSampler([_planner_process.process.pid]); _sampler.start()
-                try:
-                    _started = time.monotonic()
-                    _text = _planner.propose({"status": "ready"}, "Say ready in a short rationale", "")
-                    _text_latency = time.monotonic() - _started
-                    _started = time.monotonic()
-                    _structured = _planner.propose({"player": {"health": 20, "food": 20}, "inventory": [], "nearby_blocks": [], "nearby_entities": []}, "Propose one harmless bounded look action using the supplied observation", "")
-                    _samples = _sampler.stop()
-                    _completed["planner"] = {"status": "passed", "artifact_revision": session.reports["model_hydration"]["repositories"]["planner"]["revision"], "text_response_chars": len(_text.raw_response), "structured_response_chars": len(_structured.raw_response), "text_latency_seconds": round(_text_latency, 3), "structured_latency_seconds": round(time.monotonic() - _started, 3), "resource_peaks": summarize_resource_samples(_samples), "resource_samples": _samples}
-                finally:
-                    _sampler.stop(); session.supervisor.stop_process("nemotron")
-
-                _selector_process = start_clef(session.supervisor, session.supervisor.run_dir)
-                _selector = LocalClefClient()
-                _candidates = [Candidate("wait", "Wait briefly for a fresh state", "primitive", {"type": "wait", "duration_ms": 100}), Candidate("replan", "Return control to the planner", "replan", {})]
-                _sampler = ResourceSampler([_selector_process.process.pid]); _sampler.start()
-                try:
-                    _started = time.monotonic()
-                    _scores = _selector.choose({"player": {"health": 20, "food": 20}}, "Choose a safe bounded smoke action", _candidates)
-                    _samples = _sampler.stop()
-                    _completed["selector"] = {"status": "passed", "artifact_revision": session.reports["model_hydration"]["repositories"]["selector"]["revision"], "typed_scores": _scores, "latency_seconds": round(time.monotonic() - _started, 3), "resource_peaks": summarize_resource_samples(_samples), "resource_samples": _samples, "model": "Cloudflare/clef-flash joint schema head"}
-                finally:
-                    _sampler.stop(); session.supervisor.stop_process("clef")
-                session.reports["individual_model_probes"] = {"status": "passed", "models": _completed}
-            except Exception as exc:
-                session.reports["individual_model_probes"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:500]}", "completed": _completed}
-            if session.events:
-                session.events.append("individual_model_probes", session.reports["individual_model_probes"])
-        _report = session.reports.get("individual_model_probes", {"status": "waiting for explicit click"})
-        return mo.md(f"Individual model probes: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(combined_start_button, mo, runtime_root, session):
-    def _run():
-        if session.claim_button("combined_start", combined_start_button.value):
-            try:
-                if not session.supervisor:
-                    raise RuntimeError("create a run workspace first")
-                from minecraft_agent.model_runtime import start_clef, start_nemotron
-                import json
-                from minecraft_agent.models.local_clef import LocalClefClient
-                from minecraft_agent.models.local_nemotron import LocalNemotron
-                _hydration = json.loads((runtime_root() / "models-cache" / "hydration-manifest.json").read_text(encoding="utf-8"))
-                _run_manifest_path = session.supervisor.run_dir / "manifest.json"
-                _run_manifest = json.loads(_run_manifest_path.read_text(encoding="utf-8"))
-                for _role, _model in _hydration["repositories"].items():
-                    _run_manifest["models"][_role].update({"revision": _model["revision"], "license": _model.get("license"), "sha256": _model["sha256"]})
-                _run_manifest_path.write_text(json.dumps(_run_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                start_nemotron(session.supervisor, session.supervisor.run_dir)
-                session.planner = LocalNemotron("http://127.0.0.1:8000/v1", "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4")
-                start_clef(session.supervisor, session.supervisor.run_dir)
-                session.selector = LocalClefClient()
-                from minecraft_agent.supervisor import RunState
-                if session.supervisor.state == RunState.PREFLIGHT:
-                    session.supervisor.transition(RunState.MODELS_READY)
-                session.reports["combined_start"] = {"status": "both model processes resident", "planner_pid": session.supervisor.processes["nemotron"].process.pid, "selector_pid": session.supervisor.processes["clef"].process.pid}
-            except Exception as exc:
-                if session.supervisor:
-                    for _name in ("clef", "nemotron"):
+    selected_label = request_picker.value if request_picker is not None else None
+    selected_request_id = request_choices.get(selected_label)
+    if selected_request_id:
+        session.reports["observability_request_id"] = selected_request_id
+    context_event = next((event for event in reversed(events) if event.get("type") == "model_context" and (event.get("payload") or {}).get("request_id") == selected_request_id), None)
+    context = (context_event or {}).get("payload") or {}
+    frame_event = next((event for event in reversed(events) if event.get("type") == "viewer_frame" and (not context_event or event.get("sequence", 0) < context_event.get("sequence", 0))), None)
+    if frame_event is None and context_event and active.get("run_directory"):
+        # The status response tails only 100 events; recover the matching frame from the durable trace.
+        event_path = Path(active["run_directory"]) / "events" / "events.jsonl"
+        target_sequence = context_event.get("sequence", 0)
+        try:
+            with event_path.open("rb") as trace:
+                _trace_position = trace.seek(0, 2)
+                _trace_carry = b""
+                while _trace_position > 0 and frame_event is None:
+                    _trace_start = max(0, _trace_position - 64 * 1024)
+                    trace.seek(_trace_start)
+                    chunk = trace.read(_trace_position - _trace_start) + _trace_carry
+                    lines = chunk.split(b"\n")
+                    _trace_carry = lines[0] if _trace_start else b""
+                    for line in reversed(lines[1:] if _trace_start else lines):
                         try:
-                            session.supervisor.stop_process(_name)
-                        except Exception:
-                            pass
-                session.planner = None; session.selector = None
-                session.reports["combined_start"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
-            if session.events:
-                session.events.append("combined_start", session.reports["combined_start"])
-        _report = session.reports.get("combined_start", {"status": "waiting for explicit click"})
-        return mo.md(f"Combined models: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
+                            candidate = json.loads(line)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if candidate.get("type") == "viewer_frame" and candidate.get("sequence", 0) < target_sequence:
+                            frame_event = candidate
+                            break
+                    _trace_position = _trace_start
+        except OSError:
+            pass
+    frame_preview = mo.md("No model-input frame has been captured for this run yet.")
+    if frame_event and active.get("run_directory"):
+        frame_data = frame_event.get("payload") or {}
+        frame_path = Path(active["run_directory"]) / str(frame_data.get("path", ""))
+        if frame_path.is_file():
+            frame_bytes = frame_path.read_bytes()
+            frame_url = "data:image/png;base64," + base64.b64encode(frame_bytes).decode("ascii")
+            frame_preview = mo.Html(f'<figure style="margin:0;max-width:640px"><img alt="Latest first-person image sent to the model" src="{frame_url}" style="display:block;width:100%;height:auto;image-rendering:auto;border:1px solid #334155;border-radius:8px;background:#0f172a"><figcaption style="font:12px system-ui;color:#64748b;margin-top:6px">Frame {frame_data.get("path", "")} · {frame_data.get("width", "?")}×{frame_data.get("height", "?")} · SHA-256 {html.escape(str(frame_data.get("sha256", "unavailable"))[:16])}…</figcaption></figure>')
 
+    request_id = context.get("request_id")
+    model_message_event = next((event for event in reversed(events) if event.get("type") == "model_message" and (event.get("payload") or {}).get("request_id") == request_id), None)
+    model_message = (model_message_event or {}).get("payload") or {}
+    reasoning_updates = [
+        (event.get("payload") or {}).get("delta", "")
+        for event in events
+        if event.get("type") == "reasoning_update" and (event.get("payload") or {}).get("request_id") == request_id
+    ]
+    reasoning = model_message.get("exposed_reasoning") or "".join(reasoning_updates)
+    reasoning_panel = mo.md("No provider-exposed reasoning is available for this request yet. Hidden chain-of-thought is not inferred or fabricated.")
+    if reasoning:
+        reasoning_panel = mo.Html(f'<div style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:440px;overflow:auto;border-left:4px solid #8b5cf6;padding:12px 16px;background:#faf5ff;color:#312e50;border-radius:4px">{html.escape(reasoning)}</div>')
+    elif model_message:
+        visibility = html.escape(str(model_message.get("reasoning_visibility", "provider did not expose reasoning")))
+        reasoning_panel = mo.md(f"Provider status: **{visibility}**. The model’s private reasoning is not available to the harness.")
 
-@app.cell
-def _(combined_probe_button, mo, session):
-    def _run():
-        if session.claim_button("combined_probe", combined_probe_button.value):
-            try:
-                if not session.planner or not session.selector:
-                    raise RuntimeError("start both exact selected models first; sequential swaps do not count as co-residency")
-                from minecraft_agent.preflight import ResourceSampler, summarize_resource_samples
-                _pids = [session.supervisor.processes[_name].process.pid for _name in ("nemotron", "clef")]
-                _sampler = ResourceSampler(_pids); _sampler.start()
-                _sample = {"player": {"health": 20, "food": 20}, "nearby_blocks": [], "nearby_entities": []}
-                _rounds = []
-                try:
-                    for _index in range(3):
-                        import time
-                        _planner_started = time.monotonic()
-                        _proposal = session.planner.propose(_sample, "Choose among harmless observation actions; do not generate gameplay strategy", "")
-                        _planner_latency = time.monotonic() - _planner_started
-                        _selector_started = time.monotonic()
-                        _scores = session.selector.choose(_sample, _proposal.objective, list(_proposal.candidates))
-                        _selector_latency = time.monotonic() - _selector_started
-                        _rounds.append({"round": _index, "planner_response_chars": len(_proposal.raw_response), "planner_latency_seconds": _planner_latency, "selector_latency_seconds": _selector_latency, "candidate_ids": [item.candidate_id for item in _proposal.candidates], "selector_scores": _scores})
-                    _long_memory = "Prior verified state summary: inventory and health remain unchanged; no movement or inventory action has been taken. " * 38
-                    _long_proposal = session.planner.propose(_sample, "Read this longer context and propose one safe bounded observation action", _long_memory)
-                    _long_scores = session.selector.choose(_sample, _long_proposal.objective, list(_long_proposal.candidates))
-                    _rounds.append({"round": "long_context", "context_chars": len(_long_memory), "planner_response_chars": len(_long_proposal.raw_response), "candidate_ids": [item.candidate_id for item in _long_proposal.candidates], "selector_scores": _long_scores})
-                    for _index in range(2):
-                        _proposal = session.planner.propose(_sample, "After the longer context, propose one harmless observation action", _long_memory)
-                        _scores = session.selector.choose(_sample, _proposal.objective, list(_proposal.candidates))
-                        _rounds.append({"round": f"post_long_context_{_index + 1}", "planner_response_chars": len(_proposal.raw_response), "candidate_ids": [item.candidate_id for item in _proposal.candidates], "selector_scores": _scores})
-                finally:
-                    _samples = _sampler.stop()
-                session.reports["combined_probe"] = {"status": "alternating requests complete", "planner_revision": session.reports["model_hydration"]["repositories"]["planner"]["revision"], "selector_revision": session.reports["model_hydration"]["repositories"]["selector"]["revision"], "rounds": _rounds, "resource_peaks": summarize_resource_samples(_samples), "resource_samples": _samples}
-            except Exception as exc:
-                session.reports["combined_probe"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
-            if session.events:
-                session.events.append("combined_probe", session.reports["combined_probe"])
-        _report = session.reports.get("combined_probe", {"status": "waiting for explicit click"})
-        return mo.md(f"Co-residency: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
+    answer = model_message.get("text") or "No final answer has been recorded for this request yet."
+    answer_panel = mo.Html(f'<pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px">{html.escape(answer)}</pre>')
 
+    segments = context.get("segments") or []
+    model_info = active.get("model") or {}
+    context_window = context.get("context_window") or model_message.get("context_window") or model_info.get("context_window")
+    usage = model_message.get("usage") or {}
+    exact_input = usage.get("input_tokens")
+    estimated_input = context.get("estimated_input_tokens")
+    shown_input = exact_input if isinstance(exact_input, (int, float)) else estimated_input
+    total_estimate = sum(max(0, int(segment.get("estimated_tokens") or 0)) for segment in segments)
+    if isinstance(shown_input, (int, float)) and total_estimate > shown_input and total_estimate:
+        scale = shown_input / total_estimate
+    else:
+        scale = 1.0
+    colors = {
+        "system_prompt": "#4f46e5", "tool_definitions": "#8b5cf6", "current_observation": "#0284c7",
+        "verified_goal": "#0f766e", "frame_summaries": "#16a34a", "plan": "#65a30d",
+        "memory": "#ca8a04", "turn_instructions": "#ea580c", "current_image": "#dc2626",
+        "tool_round_history": "#db2777", "unattributed": "#64748b",
+    }
+    context_window_value = int(context_window) if isinstance(context_window, (int, float)) and context_window > 0 else None
+    used_for_bar = max(0, int(shown_input or 0))
+    allocated = sum(max(0, int(segment.get("estimated_tokens") or 0)) * scale for segment in segments)
+    remainder = max(0, used_for_bar - allocated) if exact_input is not None else 0
+    if remainder:
+        segments_for_bar = [*segments, {"key": "unattributed", "label": "Provider/image overhead", "estimated_tokens": remainder}]
+    else:
+        segments_for_bar = segments
+    denominator = context_window_value or max(used_for_bar, total_estimate, 1)
+    bar_parts = []
+    legend_parts = []
+    for segment in segments_for_bar:
+        key = str(segment.get("key", "unattributed"))
+        label = str(segment.get("label", key))
+        estimate = max(0, float(segment.get("estimated_tokens") or 0))
+        weight = estimate * scale if key != "unattributed" else estimate
+        width = min(100.0, weight / denominator * 100)
+        color = colors.get(key, "#64748b")
+        if width > 0:
+            bar_parts.append(f'<span title="{html.escape(label)} · {round(weight):,} tokens allocated" style="display:block;height:100%;width:{width:.5f}%;background:{color};min-width:1px"></span>')
+        preview = html.escape(str(segment.get("preview") or "(no text preview)"))
+        legend_parts.append(f'<details style="margin:6px 0"><summary style="cursor:pointer"><span style="display:inline-block;width:12px;height:12px;margin-right:8px;border-radius:3px;background:{color}"></span><b>{html.escape(label)}</b> · {int(segment.get("estimated_tokens") or 0):,} estimated tokens</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;padding:8px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:5px">{preview}</pre></details>')
+    context_bar = mo.md("No model context snapshot has been recorded yet.")
+    if segments and context_window_value:
+        utilization = min(100.0, used_for_bar / context_window_value * 100)
+        count_label = f"{used_for_bar:,} / {context_window_value:,} tokens ({utilization:.3f}%)"
+        authority = "provider-reported input" if exact_input is not None else "Pi estimate; awaiting provider usage"
+        context_bar = mo.Html(f'<div><div style="display:flex;justify-content:space-between;gap:12px;font:14px system-ui;margin-bottom:7px"><b>{count_label}</b><span>{authority}</span></div><div role="img" aria-label="Color-coded context window usage" style="height:22px;width:100%;display:flex;overflow:hidden;border-radius:6px;background:#e2e8f0;border:1px solid #cbd5e1">{"".join(bar_parts)}</div><div style="font:12px system-ui;color:#64748b;margin-top:7px">Window: {context_window_value:,} tokens · component sizes use Pi’s characters÷4 estimator; total is provider-reported after each response.</div><details style="margin-top:12px"><summary>Context sections and previews</summary><div style="font:13px system-ui;margin-top:8px">{"".join(legend_parts)}</div></details></div>')
 
-@app.cell
-def _(mo, session, stop_models_button):
-    def _run():
-        if session.claim_button("models_stop", stop_models_button.value):
-            try:
-                for _name in ("clef", "nemotron"):
-                    if session.supervisor and _name in session.supervisor.processes:
-                        session.supervisor.stop_process(_name)
-                session.planner = None; session.selector = None
-                session.reports["models_stop"] = {"status": "stopped"}
-            except Exception as exc:
-                session.reports["models_stop"] = {"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("models_stop", session.reports["models_stop"])
-        _report = session.reports.get("models_stop", {"status": "waiting for explicit click"})
-        return mo.md(f"Model processes: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
+    metrics_panel = mo.json({
+        "request_id": request_id,
+        "model": model_message.get("model") or context.get("model") or model_info.get("id"),
+        "provider_input_tokens": exact_input,
+        "provider_output_tokens": usage.get("output_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens"),
+        "cache_read_tokens": usage.get("cache_read_tokens"),
+        "cache_write_tokens": usage.get("cache_write_tokens"),
+        "latency_ms": (model_message.get("timing") or {}).get("latency_ms"),
+        "ttft_ms": (model_message.get("timing") or {}).get("ttft_ms"),
+        "output_tokens_per_second": (model_message.get("timing") or {}).get("output_tokens_per_second"),
+        "image_policy": model_message.get("image_policy") or context.get("image_policy"),
+    })
 
+    tool_events = [event for event in events if event.get("type") in {"tool_call_started", "tool_call_finished"}][-8:]
+    tool_panel = mo.json(tool_events or {"state": "No tool calls recorded for this run yet."})
 
-@app.cell
-def _(download_server_button, mo, runtime_root, session, config):
-    def _run():
-        if session.claim_button("server_download", download_server_button.value):
-            try:
-                if not session.run_id:
-                    raise RuntimeError("create a run workspace first")
-                import hashlib, json, subprocess, sys
-                from pathlib import Path
-                _repo = __import__("pathlib").Path(__file__).resolve().parents[1]
-                _server_dir = __import__("pathlib").Path(session.reports.get("active_server_dir", runtime_root() / "worlds" / session.run_id / "server"))
-                _result = subprocess.run([sys.executable, str(_repo / "scripts/server.py"), "--version", config.minecraft_version, "--directory", str(_server_dir), "--download"], capture_output=True, text=True, timeout=240, check=True)
-                _jar = Path(_result.stdout.strip())
-                _digest = hashlib.sha1(_jar.read_bytes()).hexdigest()
-                _run_manifest_path = session.supervisor.run_dir / "manifest.json"
-                _run_manifest = json.loads(_run_manifest_path.read_text(encoding="utf-8"))
-                _run_manifest["game"]["server_jar_sha1"] = _digest
-                _run_manifest_path.write_text(json.dumps(_run_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                session.reports["server_download"] = {"status": "downloaded_and_verified", "artifact": str(_jar), "sha1": _digest}
-            except Exception as exc:
-                session.reports["server_download"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("server_download", session.reports["server_download"])
-        _report = session.reports.get("server_download", {"status": "waiting for explicit click"})
-        return mo.md(f"Server artifact: **{_report['status']}** · {_report.get('artifact', _report.get('error', ''))}")
-    _run()
+    download = None
+    export_path = (artifact or {}).get("path") if isinstance(artifact, dict) else None
+    if export_path and Path(export_path).is_file():
+        download = mo.download(data=Path(export_path).read_bytes(), filename=Path(export_path).name, mimetype="application/zip", label="Download evidence ZIP")
 
+    state_panel = mo.json({
+        "service": status.get("service", "starting"),
+        "host_tailnet_address": status.get("tailnet"),
+        "active_run": active,
+        "previous_run": status.get("previous_run"),
+        "last_control_action": results[-1] if results else None,
+        "refresh_sequence": refresh_counter,
+    })
+    error = status_error or startup_error
+    if error:
+        state_panel = mo.callout(mo.md(f"Run service error: `{html.escape(error)}`"), kind="danger")
 
-@app.cell
-def _(mo, prepare_server_button, runtime_root, session):
-    def _run():
-        if session.claim_button("server_prepare", prepare_server_button.value):
-            try:
-                if not session.run_id:
-                    raise RuntimeError("create a run workspace first")
-                from scripts.server import prepare_server
-                _server_dir = __import__("pathlib").Path(session.reports.get("active_server_dir", runtime_root() / "worlds" / session.run_id / "server"))
-                _jar = next(_server_dir.glob("minecraft_server.*.jar"))
-                prepare_server(_server_dir)
-                session.reports["server_prepare"] = {"status": "prepared", "jar": str(_jar)}
-            except Exception as exc:
-                session.reports["server_prepare"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("server_prepare", session.reports["server_prepare"])
-        _report = session.reports.get("server_prepare", {"status": "waiting for explicit click"})
-        return mo.md(f"Server preparation: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(mo, runtime_root, session, start_server_button):
-    def _run():
-        if session.claim_button("server_start", start_server_button.value):
-            try:
-                if not session.supervisor or not session.run_id:
-                    raise RuntimeError("create a run workspace first")
-                from minecraft_agent.supervisor import RunState
-                _server_dir = __import__("pathlib").Path(session.reports.get("active_server_dir", runtime_root() / "worlds" / session.run_id / "server"))
-                _jar = next(_server_dir.glob("minecraft_server.*.jar"))
-                _proc = session.supervisor.start("minecraft-server", ["java", "-Xms1G", "-Xmx2G", "-jar", str(_jar), "nogui"], cwd=_server_dir, env={"RUN_ID": session.run_id}, ready_pattern=r"Done \(.*\)! For help", timeout=180)
-                if session.supervisor.state in {RunState.PREFLIGHT, RunState.MODELS_READY}:
-                    session.supervisor.transition(RunState.WORLD_READY)
-                session.reports["server_start"] = {"status": "ready", "pid": _proc.process.pid, "endpoint": "127.0.0.1:25565"}
-            except Exception as exc:
-                session.reports["server_start"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("server_start", session.reports["server_start"])
-        _report = session.reports.get("server_start", {"status": "waiting for explicit click"})
-        return mo.md(f"Server: **{_report['status']}** · {_report.get('error', _report.get('endpoint', ''))}")
-    _run()
-
-
-@app.cell
-def _(connect_bot_button, config, mo, os, session, _repo):
-    def _run():
-        if session.claim_button("bot_connect", connect_bot_button.value):
-            try:
-                if not session.supervisor:
-                    raise RuntimeError("create a run workspace first")
-                if session.bridge and session.bridge.process.poll() is None:
-                    raise RuntimeError("Mineflayer is already connected; stop it before reconnecting")
-                if session.bridge:
-                    session.bridge.stop(); session.bridge = None
-                from minecraft_agent.bridge_client import BridgeClient
-                _child_env = {"PATH": os.getenv("PATH", ""), "HOME": os.getenv("HOME", ""), "LANG": os.getenv("LANG", "C.UTF-8"), "RUN_ID": session.run_id, "MINECRAFT_VERSION": config.minecraft_version, "MINECRAFT_HOST": "127.0.0.1", "MINECRAFT_PORT": "25565", "MINECRAFT_VIEWER_SEQUENCE_OFFSET": str((session.reports.get("viewer_snapshot") or {}).get("sequence", 0))}
-                session.bridge = BridgeClient(["node", str(_repo / "bridge/src/bot.js")], cwd=_repo / "bridge", env=_child_env, timeout=90)
-                _ready = session.bridge.ready_event or {}
-                _observation = session.bridge.request("observe", {})
-                session.reports["observation"] = _observation
-                _comparison = None
-                _restore = session.reports.get("checkpoint_restore", {})
-                if _restore.get("status") == "verified_download_and_extracted":
-                    from minecraft_agent.persistence import compare_player_state
-                    _expected = _restore["manifest"].get("metadata", {}).get("checkpoint_observation")
-                    _comparison = compare_player_state(_expected, _observation)
-                    session.reports["restore_state_comparison"] = _comparison
-                    if session.events:
-                        session.events.append("restore_player_state_comparison", {"comparison": _comparison, "fresh_observation": _observation})
-                _connect_status = "connected" if _comparison is None or _comparison["status"] == "passed" else "connected_state_mismatch"
-                session.reports["bot_connect"] = {"status": _connect_status, "minecraft_version": _ready.get("minecraft_version"), "username": _ready.get("username"), "restore_state_comparison": _comparison}
-                _manifest_path = session.supervisor.run_dir / "manifest.json"
-                _manifest = __import__("json").loads(_manifest_path.read_text(encoding="utf-8"))
-                _manifest["game"]["server_protocol_version"] = _ready.get("minecraft_version")
-                _manifest_path.write_text(__import__("json").dumps(_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            except Exception as exc:
-                session.reports["bot_connect"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("bot_connect", session.reports["bot_connect"])
-        _report = session.reports.get("bot_connect", {"status": "waiting for explicit click"})
-        return mo.md(f"Mineflayer: **{_report['status']}** · {_report.get('error', (_report.get('restore_state_comparison') or {}).get('status', ''))}")
-    _run()
-
-
-@app.cell
-def _(mo, observe_button, session):
-    def _run():
-        if session.claim_button("bot_observe", observe_button.value):
-            try:
-                if not session.bridge:
-                    raise RuntimeError("connect Mineflayer first")
-                session.reports["observation"] = session.bridge.request("observe", {})
-                if session.events:
-                    session.events.append("observation", {"model_visible": session.reports["observation"], "source": "operator refresh"})
-            except Exception as exc:
-                session.reports["observation"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-        return mo.json(session.reports.get("observation", {"status": "waiting for explicit click"}))
-    _run()
-
-
-@app.cell
-def _(action_button, mo, session):
-    def _run():
-        if session.claim_button("smoke_action", action_button.value):
-            try:
-                if not session.bridge:
-                    raise RuntimeError("connect Mineflayer first")
-                _result = session.bridge.request("execute", {"action_id": "smoke-" + str(action_button.value), "action": {"type": "look", "yaw": 0.0, "pitch": 0.15}, "timeout_seconds": 3})
-                session.reports["smoke_action"] = {"status": "completed", "result": _result}
-                if session.events:
-                    session.events.append("smoke_action", session.reports["smoke_action"])
-            except Exception as exc:
-                session.reports["smoke_action"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-        _report = session.reports.get("smoke_action", {"status": "waiting for explicit click"})
-        return mo.md(f"Bounded Mineflayer look: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(mo, session, viewer_button):
-    def _run():
-        if session.claim_button("viewer_refresh", viewer_button.value):
-            try:
-                if not session.bridge:
-                    raise RuntimeError("connect Mineflayer first")
-                from viewer.widget import build_widget
-                import json
-                import time
-                _started = time.monotonic()
-                _snapshot = session.bridge.request("viewer_snapshot", {}, request_timeout=0.15)
-                _snapshot["request_round_trip_ms"] = round((time.monotonic() - _started) * 1000, 3)
-                _size = len(json.dumps(_snapshot).encode("utf-8"))
-                if _size > 100_000:
-                    raise RuntimeError("viewer snapshot exceeded transfer limit")
-                session.reports["viewer_snapshot"] = _snapshot
-                session.reports["viewer_widget"] = build_widget(_snapshot, session)
-                if session.events:
-                    session.events.append("viewer_snapshot", {"sequence": _snapshot["sequence"], "blocks": len(_snapshot["blocks"]), "bytes": _size, "request_round_trip_ms": _snapshot["request_round_trip_ms"], "capture_ms": _snapshot["capture_ms"], "physics_tick_samples": _snapshot["physics_tick_samples"], "physics_tick_p95_ms": _snapshot["physics_tick_p95_ms"]})
-            except Exception as exc:
-                session.reports["viewer_snapshot"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-        _widget = session.reports.get("viewer_widget")
-        if _widget is not None:
-            return _widget
-        return mo.md("Custom Three.js snapshot observer is idle. Click **Refresh observer view** after Mineflayer connects. Upstream Prismarine Viewer rendering is not integrated or verified yet.")
-    _run()
-
-
-@app.cell
-def _(mo, practice_button, runtime_root, session):
-    def _run():
-        if session.claim_button("practice_smoke", practice_button.value):
-            try:
-                from minecraft_agent.agent import AgentStep
-                from minecraft_agent.helper import HelperRunner
-                from minecraft_agent.supervisor import RunState
-                if not session.planner or not session.selector or not session.bridge:
-                    raise RuntimeError("load both models, start the server, and connect Mineflayer first")
-                if session.supervisor.state == RunState.WORLD_READY:
-                    session.supervisor.transition(RunState.RUNNING)
-                _helper_dir = __import__("pathlib").Path(session.reports.get("active_helper_dir", runtime_root() / "worlds" / session.run_id / "agent" / "helpers"))
-                _helper_runner = HelperRunner(session.bridge, _helper_dir, timeout_seconds=10, allowed_action_types={"look", "wait"}, max_actions=1)
-                _step = AgentStep(session.planner, session.selector, session.bridge, session.events, _helper_runner)
-                _result = _step.run("Practice the integration loop: propose an agent-authored JavaScript helper whose exact source is await api.act({type:'look', yaw:0.1, pitch:0}); include it as a candidate alongside replan.", allowed_action_types={"look"}, required_candidate_kind="helper")
-                _action_records = _result["result"].get("action_results", [])
-                _mineflayer_result = _action_records[0]["result"] if len(_action_records) == 1 else {}
-                _fresh_observation = _result["result"].get("observation")
-                _did_action = (_result["selected"].kind == "helper" and _result["result"].get("status") == "completed" and _result["result"].get("actions") == 1 and len(_action_records) == 1 and _mineflayer_result.get("status") == "completed" and _mineflayer_result.get("controls_released") is True and isinstance(_fresh_observation, dict))
-                session.supervisor.transition(RunState.PAUSED)
-                if not _did_action:
-                    raise RuntimeError("the planner, Clef selector, and helper did not complete exactly one permitted Mineflayer action; inspect the trace")
-                session.reports["practice"] = {"status": "passed", "turn_id": _result["turn_id"], "candidate_id": _result["selected"].candidate_id, "scores": _result["scores"], "helper": {key: _result["result"].get(key) for key in ("helper", "revision", "helper_sha256", "execution_mode")}, "action_id": _action_records[0]["action_id"], "mineflayer_result": _mineflayer_result, "fresh_observation": _fresh_observation}
-            except Exception as exc:
-                if session.supervisor and session.supervisor.state == RunState.RUNNING:
-                    from minecraft_agent.supervisor import RunState
-                    session.supervisor.transition(RunState.PAUSED)
-                session.reports["practice"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
-            if session.events:
-                session.events.append("practice_smoke", session.reports["practice"])
-        _report = session.reports.get("practice", {"status": "waiting for explicit click"})
-        return mo.md(f"Practice run: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(mo, runtime_root, session, stop_button):
-    def _run():
-        if session.claim_button("operator_stop", stop_button.value):
-            try:
-                if session.bridge:
-                    try:
-                        _final_observation = session.bridge.request("observe", {})
-                        session.reports["checkpoint_observation"] = _final_observation
-                        if session.events:
-                            session.events.append("checkpoint_pre_observation", {"model_visible": _final_observation, "source": "operator stop"})
-                    except Exception as _observe_error:
-                        session.reports["checkpoint_observation"] = None
-                        if session.events:
-                            session.events.append("checkpoint_pre_observation_error", {"error_type": type(_observe_error).__name__})
-                    session.bridge.stop(); session.bridge = None
-                if session.supervisor:
-                    session.supervisor.stop_minecraft_server()
-                    session.supervisor.stop_all()
-                session.planner = None; session.selector = None
-                session.reports["operator_stop"] = {"status": "stopped cleanly"}
-            except Exception as exc:
-                session.reports["operator_stop"] = {"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("operator_stop", session.reports["operator_stop"])
-        _report = session.reports.get("operator_stop", {"status": "waiting for explicit click"})
-        return mo.md(f"Process cleanup: **{_report['status']}** · {_report.get('error', '')}")
-    _run()
-
-
-@app.cell
-def _(checkpoint_button, mo, runtime_root, session):
-    def _run():
-        if session.claim_button("checkpoint", checkpoint_button.value):
-            try:
-                if not session.supervisor or not session.run_id:
-                    raise RuntimeError("create a run first")
-                from minecraft_agent.persistence import create_snapshot
-                import json
-                import uuid
-                from minecraft_agent.supervisor import RunState
-                _run_dir = session.supervisor.run_dir
-                _world_dir = __import__("pathlib").Path(session.reports.get("active_server_dir", runtime_root() / "worlds" / session.run_id / "server"))
-                _helper_dir = __import__("pathlib").Path(session.reports.get("active_helper_dir", runtime_root() / "worlds" / session.run_id / "agent" / "helpers"))
-                _destination = runtime_root() / "runs" / (session.run_id + "-" + uuid.uuid4().hex[:12] + ".zip")
-                if session.bridge:
-                    session.reports["checkpoint_observation"] = session.bridge.request("observe", {})
-                    if session.events:
-                        session.events.append("checkpoint_pre_observation", {"model_visible": session.reports["checkpoint_observation"], "source": "checkpoint"})
-                    session.bridge.stop(); session.bridge = None
-                if session.supervisor.state in {RunState.WORLD_READY, RunState.RUNNING}:
-                    session.supervisor.transition(RunState.PAUSED)
-                if session.supervisor.state in {RunState.PAUSED, RunState.WORLD_READY}:
-                    session.supervisor.transition(RunState.CHECKPOINTING)
-                if session.supervisor.state == RunState.CHECKPOINTING:
-                    session.supervisor.stop_minecraft_server()
-                    for _name in ("clef", "nemotron"):
-                        session.supervisor.stop_process(_name)
-                    session.planner = None; session.selector = None
-                    session.supervisor.transition(RunState.PAUSED)
-                if session.events:
-                    session.events.append("checkpoint_begin", {"state": session.supervisor.state.value, "elapsed_seconds": session.events.elapsed_seconds})
-                _run_manifest = json.loads((_run_dir / "manifest.json").read_text(encoding="utf-8"))
-                _previous = session.reports.get("checkpoint", {}).get("snapshot_id")
-                _manifest = create_snapshot({"agent": _run_dir, "world": _world_dir, "helpers": _helper_dir}, _destination, metadata={"run_id": session.run_id, "world_id": _run_manifest["world_id"], "state": session.supervisor.state.value, "final_event_sequence": session.events.sequence if session.events else 0, "elapsed_seconds": session.events.elapsed_seconds if session.events else 0.0, "checkpoint_observation": session.reports["checkpoint_observation"]}, previous_snapshot_id=_previous)
-                session.reports["checkpoint"] = {"status": "verified_local_only", "snapshot_id": _manifest["snapshot_id"], "path": str(_destination), "remote": "not configured"}
-            except Exception as exc:
-                try:
-                    from minecraft_agent.supervisor import RunState
-                    if session.supervisor and session.supervisor.state == RunState.CHECKPOINTING:
-                        session.supervisor.transition(RunState.PAUSED)
-                except Exception:
-                    pass
-                session.reports["checkpoint"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("checkpoint", session.reports["checkpoint"])
-        _report = session.reports.get("checkpoint", {"status": "waiting for explicit click"})
-        return mo.md(f"Checkpoint: **{_report['status']}** · {_report.get('error', _report.get('path', ''))}")
-    _run()
-
-
-@app.cell
-def _(mo, session, upload_button):
-    def _run():
-        if session.claim_button("checkpoint_upload", upload_button.value):
-            try:
-                _checkpoint = session.reports.get("checkpoint", {})
-                if _checkpoint.get("status") != "verified_local_only":
-                    raise RuntimeError("create and locally verify a checkpoint first")
-                import os
-                from minecraft_agent.persistence import upload_huggingface, upload_s3
-                _path = _checkpoint["path"]
-                _hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
-                if os.getenv("MINECRAFT_ARTIFACT_REPO") and _hf_token:
-                    _uri = upload_huggingface(_path, os.environ["MINECRAFT_ARTIFACT_REPO"], _hf_token)
-                elif os.getenv("MINECRAFT_S3_BUCKET"):
-                    _uri = upload_s3(_path, os.environ["MINECRAFT_S3_BUCKET"], os.getenv("MINECRAFT_S3_KEY_PREFIX", "minecraft-agent") + "/" + __import__("pathlib").Path(_path).name)
-                elif os.getenv("MINECRAFT_ARTIFACT_REPO"):
-                    raise RuntimeError("HF artifact repository is configured but no HF token is available")
-                else:
-                    session.reports["checkpoint_upload"] = {"status": "local_export_ready", "path": _path, "remote": "not configured"}
-                    _uri = None
-                if _uri:
-                    session.reports["checkpoint_upload"] = {"status": "uploaded", "uri": _uri}
-            except Exception as exc:
-                session.reports["checkpoint_upload"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("checkpoint_upload", session.reports["checkpoint_upload"])
-        _report = session.reports.get("checkpoint_upload", {"status": "waiting for explicit click"})
-        _download = None
-        if _report.get("status") == "local_export_ready":
-            from pathlib import Path
-            _path = Path(_report["path"])
-            _download = mo.download(data=lambda: _path.read_bytes(), filename=_path.name, mimetype="application/zip", label="Download local checkpoint")
-        return mo.vstack([mo.md(f"Checkpoint export: **{_report['status']}** · {_report.get('uri', _report.get('error', _report.get('remote', '')))}"), _download] if _download is not None else [mo.md(f"Checkpoint export: **{_report['status']}** · {_report.get('error', _report.get('uri', ''))}")])
-    _run()
-
-
-@app.cell
-def _(mo, runtime_root, session, restore_button):
-    def _run():
-        if session.claim_button("checkpoint_restore", restore_button.value):
-            try:
-                import os
-                _upload = session.reports.get("checkpoint_upload", {})
-                _uri = os.getenv("MINECRAFT_RESTORE_URI") or (_upload.get("uri") if _upload.get("status") == "uploaded" else None)
-                for _key in ("bot_connect", "observation", "practice", "evidence_export", "restore_state_comparison", "resume"):
-                    session.reports.pop(_key, None)
-                import uuid
-                from minecraft_agent.persistence import restore_remote, restore_snapshot, _sha256
-                _restore_root = runtime_root() / "runs" / "restores" / ("restore-" + uuid.uuid4().hex[:8])
-                if _uri:
-                    _restored = restore_remote(_uri, _restore_root)
-                    _manifest = _restored["manifest"]
-                    _restored_path = _restored["restore_path"]
-                    _archive_sha256 = _restored["archive_sha256"]
-                else:
-                    _checkpoint = session.reports.get("checkpoint", {})
-                    if _checkpoint.get("status") != "verified_local_only":
-                        raise RuntimeError("create a local checkpoint first")
-                    _manifest = restore_snapshot(_checkpoint["path"], _restore_root)
-                    _restored_path = str(_restore_root)
-                    _archive_sha256 = _sha256(_checkpoint["path"])
-                _expected_snapshot = session.reports.get("checkpoint", {}).get("snapshot_id")
-                if _expected_snapshot and _manifest["snapshot_id"] != _expected_snapshot:
-                    raise RuntimeError("restored snapshot ID differs from the checkpoint selected for this run")
-                session.reports["checkpoint_restore"] = {"status": "verified_download_and_extracted", "snapshot_id": _manifest["snapshot_id"], "sha256": _archive_sha256, "manifest": _manifest, "uri": _uri or "local", "restore_path": _restored_path, "game_resume_requires_fresh_session": True}
-            except Exception as exc:
-                session.reports["checkpoint_restore"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("checkpoint_restore_verify", session.reports["checkpoint_restore"])
-        _report = session.reports.get("checkpoint_restore", {"status": "waiting for explicit click"})
-        return mo.md(f"Remote restore verification: **{_report['status']}** · {_report.get('error', _report.get('snapshot_id', ''))}")
-    _run()
-
-
-@app.cell
-def _(mo, resume_button, session):
-    def _run():
-        if session.claim_button("resume_restored_world", resume_button.value):
-            try:
-                _restore = session.reports.get("checkpoint_restore", {})
-                if _restore.get("status") != "verified_download_and_extracted":
-                    raise RuntimeError("download, hash-verify, and extract a checkpoint first")
-                import json
-                from pathlib import Path
-                from minecraft_agent.events import EventLog
-                from minecraft_agent.supervisor import RunState, Supervisor
-                _restored = Path(_restore["restore_path"])
-                _agent_dir = _restored / "agent"
-                _world_dir = _restored / "world"
-                _helper_dir = _restored / "helpers"
-                _manifest = json.loads((_agent_dir / "manifest.json").read_text(encoding="utf-8"))
-                _run_id = _manifest["run_id"]
-                _world_id = _manifest["world_id"]
-                if session.supervisor and session.supervisor.run_id == _run_id and Path(session.supervisor.run_dir).resolve() == _agent_dir.resolve() and session.supervisor.state != RunState.STOPPED:
-                    if session.supervisor.status().get("processes", {}).get("minecraft-server", {}).get("running"):
-                        raise RuntimeError("stop the current Minecraft server before resuming a restored snapshot")
-                    _supervisor = session.supervisor
-                else:
-                    if session.supervisor and any(item.process.poll() is None for item in session.supervisor.processes.values()):
-                        raise RuntimeError("stop the current run before restoring another world")
-                    _supervisor = Supervisor(_agent_dir, _run_id)
-                session.run_id = _run_id
-                session.supervisor = _supervisor
-                _checkpoint_elapsed = float(_restore["manifest"].get("metadata", {}).get("elapsed_seconds", 0.0))
-                session.events = EventLog(_agent_dir / "events" / "events.jsonl", _run_id, _world_id, elapsed_offset=_checkpoint_elapsed)
-                _expected_sequence = int(_restore["manifest"].get("metadata", {}).get("final_event_sequence", 0))
-                if session.events.sequence != _expected_sequence:
-                    raise RuntimeError(f"restored event sequence {session.events.sequence} differs from checkpoint marker {_expected_sequence}")
-                session.events.append("session_start", {"restored_from_snapshot": _restore["snapshot_id"], "previous_sequence": session.events.sequence})
-                _elapsed_before_resume = _checkpoint_elapsed
-                _jar = next(_world_dir.glob("minecraft_server.*.jar"))
-                _proc = session.supervisor.start("minecraft-server", ["java", "-Xms1G", "-Xmx2G", "-jar", str(_jar), "nogui"], cwd=_world_dir, env={"RUN_ID": _run_id}, ready_pattern=r"Done \(.*\)! For help", timeout=180)
-                session.supervisor.transition(RunState.WORLD_READY)
-                session.reports["active_server_dir"] = str(_world_dir)
-                session.reports["active_helper_dir"] = str(_helper_dir)
-                session.reports["server_start"] = {"status": "ready", "pid": _proc.process.pid, "endpoint": "127.0.0.1:25565", "restored_snapshot": _restore["snapshot_id"]}
-                _archive_files = _restore["manifest"].get("files", [])
-                _world_entries = [item for item in _archive_files if item["path"].startswith("world/")]
-                _player_entries = [item for item in _world_entries if "/playerdata/" in item["path"]]
-                _helper_entries = [item for item in _archive_files if item["path"].startswith("helpers/")]
-                session.reports["resume"] = {"status": "server_restored_and_ready", "run_id": _run_id, "world_id": _world_id, "world_files_verified": len(_world_entries), "playerdata_files_verified": len(_player_entries), "helper_revisions_restored": {item["path"]: item["sha256"] for item in _helper_entries}, "event_sequence_continues_from": session.events.sequence, "player_state_comparison": "pending Mineflayer reconnect", "elapsed_seconds_before_resume": _elapsed_before_resume, "elapsed_seconds": session.events.elapsed_seconds}
-            except Exception as exc:
-                session.reports["resume"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
-            if session.events:
-                session.events.append("resume_attempt", session.reports["resume"])
-        _report = session.reports.get("resume", {"status": "waiting for explicit click"})
-        return mo.md(f"World resume: **{_report['status']}** · {_report.get('error', _report.get('run_id', ''))}")
-    _run()
-
-
-@app.cell
-def _(evidence_export_button, mo, runtime_root, session):
-    def _run():
-        if session.claim_button("practice_evidence_export", evidence_export_button.value):
-            try:
-                from pathlib import Path
-                from minecraft_agent.persistence import create_snapshot
-                import uuid
-                _run_dir = session.supervisor.run_dir
-                _helper_dir = Path(session.reports["active_helper_dir"])
-                if session.events:
-                    session.events.append("evidence_export_begin", {"practice_turn_id": session.reports["practice"]["turn_id"]})
-                _destination = runtime_root() / "runs" / "exports" / (session.run_id + "-practice-" + uuid.uuid4().hex[:8] + ".zip")
-                _snapshot = create_snapshot({"agent": _run_dir, "helpers": _helper_dir}, _destination, metadata={"evidence_type": "bounded_model_to_game_practice", "run_id": session.run_id, "practice": session.reports["practice"], "final_event_sequence": session.events.sequence if session.events else 0, "elapsed_seconds": session.events.elapsed_seconds if session.events else 0.0})
-                session.reports["evidence_export"] = {"status": "verified", "snapshot_id": _snapshot["snapshot_id"], "path": str(_destination), "files": len(_snapshot["files"])}
-            except Exception as exc:
-                session.reports["evidence_export"] = {"status": "blocked", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            if session.events:
-                session.events.append("evidence_export", session.reports["evidence_export"])
-        _report = session.reports.get("evidence_export", {"status": "waiting for explicit click"})
-        _download = None
-        if _report.get("status") == "verified":
-            from pathlib import Path
-            _path = Path(_report["path"])
-            _download = mo.download(data=lambda: _path.read_bytes(), filename=_path.name, mimetype="application/zip", label="Download verified practice evidence")
-        return mo.vstack([mo.md(f"Practice evidence export: **{_report['status']}** · {_report.get('error', _report.get('snapshot_id', ''))}"), _download] if _download is not None else [mo.md(f"Practice evidence export: **{_report['status']}** · {_report.get('error', '')}")])
-    _run()
-
-
-@app.cell
-def _(mo, session):
-    _status = session.supervisor.status() if session.supervisor else {"state": "no run"}
-    mo.json(_status)
-    return (_status,)
+    mo.vstack([
+        mo.md("# Minecraft long-run harness\n\nA model-agnostic Pi control plane over a persistent Linux supervisor. The model gets a fresh first-person Prismarine Viewer frame as the final item of each new turn, native tools, a run-isolated workspace, and a persistent Mineflayer program runner."),
+        auth_panel,
+        controls,
+        refresh,
+        mo.md("## Live bot view · Prismarine Viewer"),
+        viewer if viewer is not None else mo.md("Start a run to show the first-person viewer."),
+        mo.md("### Latest exact image sent to the model"),
+        frame_preview,
+        mo.md("## Agent reasoning and response"),
+        mo.md("Provider-exposed reasoning summary only; models may withhold private chain-of-thought."),
+        reasoning_panel,
+        mo.md("### Final answer"),
+        answer_panel,
+        mo.md("## Context window at the selected request"),
+        request_picker if request_picker is not None else mo.md("No model request has been recorded yet."),
+        context_bar,
+        mo.md("### Request telemetry"),
+        metrics_panel,
+        mo.md("### Recent tool activity"),
+        tool_panel,
+        mo.md("## Run state and trace"),
+        state_panel,
+        download if download is not None else mo.md("Run exports appear here after selecting Export."),
+    ])
+    return
 
 
 if __name__ == "__main__":

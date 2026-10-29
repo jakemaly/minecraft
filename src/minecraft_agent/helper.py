@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .sandbox import worker_command
+from .sandbox import cleanup_worker, stop_worker, worker_command, worker_execution_mode
 
 
 class CapabilityServer:
@@ -70,7 +70,8 @@ class CapabilityServer:
                             self.actions_done += 1
                             action_id = f"{uuid.uuid4()}:{actions}"
                             try:
-                                result = self.bot.request("execute", {"action_id": action_id, "action": action, "timeout_seconds": 3})
+                                # Helpers need the action acknowledgement; AgentStep fetches a fresh observation separately.
+                                result = self.bot.request("execute", {"action_id": action_id, "action": action, "timeout_seconds": 5, "include_observation": False})
                                 self.action_results.append({"action_id": action_id, "result": result})
                             except Exception as exc:
                                 self.action_results.append({"action_id": action_id, "result": {"status": "unknown", "controls_released": False, "error_type": type(exc).__name__}})
@@ -82,7 +83,7 @@ class CapabilityServer:
                         response = {"version": 1, "request_id": request.get("request_id") if isinstance(request, dict) else None, "error": {"code": "capability_denied", "message": str(exc)[:300]}}
                     payload = json.dumps(response, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
                     if len(payload) > self.max_bytes:
-                        raise ValueError("capability response exceeds size limit")
+                        payload = json.dumps({"version": 1, "request_id": request.get("request_id"), "error": {"code": "response_too_large", "message": "capability response exceeds size limit"}}, separators=(",", ":")).encode("utf-8") + b"\n"
                     stream.write(payload)
                     stream.flush()
         except Exception as exc:
@@ -129,17 +130,20 @@ class HelperRunner:
             worker_template = Path(__file__).resolve().parents[2] / "bridge" / "src" / "worker.js"
             wrapper.write_bytes(worker_template.read_bytes())
             command = worker_command(wrapper, self.helper_directory, socket_path, helper_filename=helper_path.name, timeout_seconds=self.timeout_seconds)
+            execution_mode = worker_execution_mode(command)
             try:
                 child_env = {"PATH": os.getenv("PATH", "/usr/bin:/bin"), "HOME": str(self.helper_directory), "LANG": os.getenv("LANG", "C.UTF-8"), "CAPABILITY_SOCKET": str(socket_path), "HELPER_DIRECTORY": str(self.helper_directory)}
                 result = subprocess.run(command, cwd=self.helper_directory, env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=self.timeout_seconds + 3, check=False)
                 self.action_results = list(server.action_results)
                 if result.returncode:
-                    return {"status": "unknown", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": "operator_authorized_unsandboxed_fallback", "actions": server.actions_done, "action_results": self.action_results, "error_type": "WorkerExit", "exit_code": result.returncode, "stderr_tail": result.stderr.decode("utf-8", errors="replace")[-500:]}
+                    return {"status": "unknown", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": execution_mode, "actions": server.actions_done, "action_results": self.action_results, "error_type": "WorkerExit", "exit_code": result.returncode, "stderr_tail": result.stderr.decode("utf-8", errors="replace")[-500:]}
                 if server.error:
-                    return {"status": "unknown", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": "operator_authorized_unsandboxed_fallback", "actions": server.actions_done, "action_results": self.action_results, "error_type": type(server.error).__name__}
-                return {"status": "completed", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": "operator_authorized_unsandboxed_fallback", "actions": server.actions_done, "action_results": self.action_results}
+                    return {"status": "unknown", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": execution_mode, "actions": server.actions_done, "action_results": self.action_results, "error_type": type(server.error).__name__}
+                return {"status": "completed", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": execution_mode, "actions": server.actions_done, "action_results": self.action_results}
             except subprocess.TimeoutExpired:
+                stop_worker(command)
                 self.action_results = list(server.action_results)
-                return {"status": "unknown", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": "operator_authorized_unsandboxed_fallback", "actions": server.actions_done, "action_results": self.action_results, "error_type": "TimeoutExpired"}
+                return {"status": "unknown", "helper": helper_path.name, "revision": revision, "helper_sha256": helper_sha256, "execution_mode": execution_mode, "actions": server.actions_done, "action_results": self.action_results, "error_type": "TimeoutExpired"}
             finally:
+                cleanup_worker(command)
                 server.close()

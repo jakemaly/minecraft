@@ -33,7 +33,8 @@ class AgentStep:
                 validate_proposal(proposal)
                 break
             except Exception as exc:
-                self.events.append("planner_error", {"turn_id": turn_id, "attempt": attempt + 1, "error_type": type(exc).__name__, "message": str(exc)[:300]})
+                raw_preview = getattr(self.planner, "last_raw_response", "")[-1_200:]
+                self.events.append("planner_error", {"turn_id": turn_id, "attempt": attempt + 1, "error_type": type(exc).__name__, "message": str(exc)[:300], "raw_response_preview": raw_preview})
                 proposal = None
         if proposal is None:
             proposal = Proposal(objective, "Planner failed validation twice; return control for a new observation.", (Candidate("replan", "Stop and return control to the planner", "replan", {}),), "")

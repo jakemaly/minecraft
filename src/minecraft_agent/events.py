@@ -11,12 +11,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_SECRET_PARTS = ("token", "secret", "password", "api_key", "authorization", "credential")
+_SECRET_PARTS = ("secret", "password", "api_key", "authorization", "credential")
+
+
+def _secret_key(key: Any) -> bool:
+    normalized = str(key).lower()
+    return (
+        normalized == "token" or normalized.endswith("_token")
+        or any(part in normalized for part in _SECRET_PARTS)
+    )
 
 
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: ("[REDACTED]" if any(part in key.lower() for part in _SECRET_PARTS) else redact(item)) for key, item in value.items()}
+        return {key: ("[REDACTED]" if _secret_key(key) else redact(item)) for key, item in value.items()}
     if isinstance(value, list):
         return [redact(item) for item in value]
     return value

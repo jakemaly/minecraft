@@ -5,6 +5,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
   "vllm==0.32.0",
   "minecraft-agent-harness",
+  "cuda-toolkit[all]==13.0.3.0",
   "ninja>=1.11,<2",
   "flashinfer-cubin==0.7.0.post1",
   "flashinfer-jit-cache==0.7.0.post1+cu130",
