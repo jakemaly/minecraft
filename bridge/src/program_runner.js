@@ -55,10 +55,50 @@ function createProgramRunner({ bot, isReady, remember, requireFn = require, glob
     const started = performance.now();
     let timer;
     let status = 'completed';
+    const usesProcessExit = /\bprocess\b[\s\S]{0,80}(?:\.\s*exit|\[\s*['"]exit['"]\s*\])/.test(source);
+    let resolveProgramExit;
+    let programExitCode;
+    const programExit = new Promise((resolve) => { resolveProgramExit = resolve; });
+    const requestProgramExit = (code = 0) => {
+      if (programExitCode !== undefined) return;
+      programExitCode = Number.isInteger(code) ? code : 0;
+      resolveProgramExit(programExitCode);
+    };
     try {
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
       const moduleObject = { exports: {} };
-      const executeProgram = new AsyncFunction('bot', 'require', 'global', 'console', 'signal', 'module', 'exports', `'use strict';\n${source}\n`);
+      const programProcess = new Proxy(process, {
+        get(target, property) {
+          if (property === 'exit') return requestProgramExit;
+          if (property === 'abort' || property === 'kill') {
+            return () => { throw new Error(`process.${String(property)} is unavailable in mc-run; return from the script instead`); };
+          }
+          return Reflect.get(target, property, target);
+        },
+        set(target, property, value) {
+          if (property === 'exitCode') throw new Error('process.exitCode is unavailable in mc-run');
+          return Reflect.set(target, property, value, target);
+        },
+      });
+      let programGlobal;
+      programGlobal = new Proxy(globalObject, {
+        get(target, property, receiver) {
+          if (property === 'process') return programProcess;
+          if (property === 'global' || property === 'globalThis') return programGlobal;
+          return Reflect.get(target, property, receiver);
+        },
+        set(target, property, value, receiver) {
+          if (property === 'process') throw new Error('global.process is unavailable in mc-run');
+          return Reflect.set(target, property, value, receiver);
+        },
+      });
+      const programRequire = new Proxy(requireFn, {
+        apply(target, thisArg, args) {
+          if (args[0] === 'process' || args[0] === 'node:process') return programProcess;
+          return Reflect.apply(target, thisArg, args);
+        },
+      });
+      const executeProgram = new AsyncFunction('bot', 'require', 'global', 'console', 'signal', 'module', 'exports', 'process', 'globalThis', `'use strict';\n${source}\n`);
       const cancellation = new Promise((_, reject) => {
         controller.signal.addEventListener('abort', () => {
           const error = new Error(record.timedOut ? 'program deadline exceeded' : 'program cancelled');
@@ -77,7 +117,11 @@ function createProgramRunner({ bot, isReady, remember, requireFn = require, glob
       });
       const result = await Promise.race([
         (async () => {
-          const bodyResult = await executeProgram(programBot, requireFn, globalObject, scopedConsole, controller.signal, moduleObject, moduleObject.exports);
+          const bodyResult = await executeProgram(programBot, programRequire, programGlobal, scopedConsole, controller.signal, moduleObject, moduleObject.exports, programProcess, programGlobal);
+          if (bodyResult === undefined && usesProcessExit) {
+            const exitCode = await programExit;
+            if (exitCode !== 0) throw new Error(`program requested exit with code ${exitCode}`);
+          }
           const exported = moduleObject.exports;
           if (typeof exported === 'function') return await exported(programBot);
           if (exported && typeof exported.run === 'function') return await exported.run(programBot);

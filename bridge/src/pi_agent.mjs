@@ -2,12 +2,13 @@
 import { Socket } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Type } from 'typebox';
+import { captureViewerImage, handoffViewerImage, steerViewerImage } from './viewer_capture.mjs';
+import { localModelSettings, probeLocalModel, writeLocalModelsJson } from './local_model.mjs';
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -26,6 +27,8 @@ const controlSocket = process.env.MINECRAFT_AGENT_CONTROL_SOCKET;
 const stableSystemPrompt = `You are the control agent for a real Minecraft Survival world.
 
 Your objective is the only success criterion for this run. Observe before acting and verify game state after each meaningful action. Use Mineflayer programs for multi-step abilities: write them under scripts/, run short tests, then reuse reliable programs. Record verified mechanics and useful procedures in memory.md. Keep plan.md current. Publish a tested reusable skill with ` + '`mc-skill publish skills/<name>`' + ` after its test.sh passes; published versions are copied into later run workspaces. Do not claim progress that game state does not confirm.
+
+Before a tool action, give one brief user-facing progress update describing the next action or a verified finding. Keep updates concise; never reveal private chain-of-thought.
 
 Control only the supplied Mineflayer bot. Do not create, connect, or impersonate additional Minecraft clients, and do not use admin commands or exploit server configuration. The human observer is a spectator and must not provide gameplay assistance.
 
@@ -56,6 +59,14 @@ let currentRun = null;
 let shuttingDown = false;
 let accountCatalogCache = null;
 let accountCatalogCacheAt = 0;
+const frameSequences = new Map();
+
+function requestSessionAbort(run) {
+  try {
+    const pending = run?.session?.abort?.();
+    if (pending && typeof pending.catch === 'function') void pending.catch(() => {});
+  } catch {}
+}
 
 function emit(event, payload = {}) {
   process.stdout.write(`${JSON.stringify({ event, ...payload })}\n`);
@@ -71,19 +82,46 @@ function safeToolText(value, limit = 12_000) {
   return text;
 }
 
+function playerHealthFromToolResult(value, depth = 0) {
+  if (depth > 4 || value == null) return null;
+  if (typeof value === 'string') {
+    try { return playerHealthFromToolResult(JSON.parse(value), depth + 1); } catch { return null; }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const health = playerHealthFromToolResult(item, depth + 1);
+      if (health !== null) return health;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+  const player = value.player || value.observation?.player;
+  if (player && Number.isFinite(Number(player.health))) return Number(player.health);
+  const nested = [value.details, ...(Array.isArray(value.content) ? value.content.map((item) => item?.text) : [])];
+  for (const item of nested) {
+    const health = playerHealthFromToolResult(item, depth + 1);
+    if (health !== null) return health;
+  }
+  return null;
+}
+
 function sha256(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
 async function runtime() {
   if (!modelRuntimePromise) {
-    modelRuntimePromise = ModelRuntime.create({
-      authPath: path.join(agentDir, 'auth.json'),
-      modelsPath: path.join(agentDir, 'models.json'),
-      modelsStorePath: path.join(agentDir, 'model-catalog.json'),
-      allowModelNetwork: false,
-      refreshOnCreate: false,
-    });
+    modelRuntimePromise = (async () => {
+      const local = localModelSettings();
+      const modelsPath = local ? await writeLocalModelsJson(agentDir, local) : path.join(agentDir, 'models.json');
+      return await ModelRuntime.create({
+        authPath: path.join(agentDir, 'auth.json'),
+        modelsPath,
+        modelsStorePath: path.join(agentDir, local ? 'molab-model-catalog.json' : 'model-catalog.json'),
+        allowModelNetwork: false,
+        refreshOnCreate: false,
+      });
+    })();
   }
   return modelRuntimePromise;
 }
@@ -150,7 +188,7 @@ function modelMetadata(model) {
     max_output_tokens: model.maxTokens,
     image_input: model.input?.includes('image') === true,
     reasoning: model.reasoning === true,
-    selection_policy: 'account-listed model supported by Pi with image input and Responses API',
+    selection_policy: 'configured model supported by Pi with image input',
   };
 }
 
@@ -160,6 +198,19 @@ function applySupportedContext(model) {
 }
 
 async function accountModels({ force = false } = {}) {
+  const local = localModelSettings();
+  if (local) {
+    const models = await runtime();
+    const model = models.getModel(local.provider, local.id);
+    if (!model || !model.input?.includes('image')) throw new Error(`Pi has no image-capable model metadata for local model ${local.id}`);
+    const chosen = await probeLocalModel(local);
+    return {
+      candidates: [chosen], chosen,
+      default_model_id: chosen.id, default_model_pinned: true,
+      pin_error: null, catalog_order_preserved: true,
+      selection_policy: 'pinned local Molab vLLM model',
+    };
+  }
   if (!force && accountCatalogCache && Date.now() - accountCatalogCacheAt < 60_000) return accountCatalogCache;
   const models = await runtime();
   const credentials = await models.listCredentials();
@@ -279,6 +330,15 @@ function startLogin() {
 }
 
 async function authStatus() {
+  const local = localModelSettings();
+  if (local) {
+    try {
+      const selection = await accountModels({ force: true });
+      return { connected: true, login_in_progress: false, account_model_catalog: selection, inference_mode: 'local_vllm', provider: local.provider };
+    } catch (error) {
+      return { connected: false, login_in_progress: false, account_model_catalog: null, inference_mode: 'local_vllm', provider: local.provider, error: errorText(error) };
+    }
+  }
   const models = await runtime();
   const credentials = await models.listCredentials();
   const connected = credentials.some((item) => item.providerId === 'openai' && item.type === 'oauth');
@@ -311,7 +371,15 @@ function toolResult(value, isError = false) {
   return { content: [{ type: 'text', text }], details: value, isError };
 }
 
-function createTool(name, description, properties, perform) {
+function traceValue(value) {
+  try {
+    const encoded = JSON.stringify(value);
+    if (Buffer.byteLength(encoded, 'utf8') <= 100_000) return value;
+  } catch {}
+  return { truncated: true, preview: safeToolText(value, 12_000) };
+}
+
+function createTool(name, description, properties, perform, traceRun = null) {
   return defineTool({
     name,
     label: name,
@@ -320,12 +388,31 @@ function createTool(name, description, properties, perform) {
     parameters: Type.Object(properties),
     executionMode: 'sequential',
     async execute(_toolCallId, params, signal) {
-      if (signal?.aborted) return toolResult({ error: 'tool call cancelled' }, true);
+      const startedAt = performance.now();
+      const record = (result, isError) => {
+        if (!traceRun?.currentStep) return;
+        traceRun.currentStep.tool_calls.push({
+          tool_call_id: _toolCallId, tool: name, arguments: traceValue(params || {}),
+          result: traceValue(result), is_error: isError,
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
+      };
+      if (signal?.aborted) {
+        const value = { error: 'tool call cancelled' };
+        record(value, true);
+        return toolResult(value, true);
+      }
       try {
         const value = await perform(params);
-        return toolResult(value, value?.ok === false || value?.status === 'test_failed');
+        const isError = value?.ok === false || value?.status === 'test_failed';
+        record(value, isError);
+        return toolResult(value, isError);
       }
-      catch (error) { return toolResult({ error: errorText(error) }, true); }
+      catch (error) {
+        const value = { error: errorText(error) };
+        record(value, true);
+        return toolResult(value, true);
+      }
     },
   });
 }
@@ -339,8 +426,12 @@ function makeTools(run) {
     const summary = compactToolArguments(name, args);
     const result = await rpc('workspace_tool', { run_id: run.run_id, tool: name, arguments: args }, name === 'bash' ? (args.timeout_seconds || 60) * 1000 + 15_000 : 30_000);
     await rpc('agent_event', { run_id: run.run_id, type: 'tool_call', payload: { tool: name, arguments: summary, result } });
+    if (name === 'bash' && /\bmc-run(?:\s|$)/.test(args.command || '') && run.session) {
+      const frame = await captureScreenshot(run);
+      await steerViewerImage(run.session, 'Fresh first-person frame after the latest Mineflayer action. Use this image with the action result to choose the next step.', frame);
+    }
     return result;
-  });
+  }, run);
 
   const tools = [
     workspace('read', 'Read a workspace-relative file. Use full=true only when needed.', { path: string('Workspace-relative file path'), full: optionalBool('Return the complete file instead of the compact default') }),
@@ -350,9 +441,9 @@ function makeTools(run) {
     workspace('grep', 'Search text files in this run workspace using a regular expression.', { pattern: string('Regular expression'), path: optionalString('Workspace-relative file or directory'), ignore_case: optionalBool('Ignore letter case'), max_matches: optionalInt('Maximum matches', 1, 200) }),
     workspace('find', 'Find files and directories in this run workspace using a glob.', { path: optionalString('Workspace-relative directory'), pattern: optionalString('Glob pattern'), max_results: optionalInt('Maximum paths', 1, 500) }),
     workspace('ls', 'List one workspace directory.', { path: optionalString('Workspace-relative directory'), all: optionalBool('Include hidden entries') }),
-    createTool('minecraft_observe', 'Read the current player, inventory, nearby entities and blocks from Mineflayer.', {}, async () => await bridgeRequest(run, 'observe')),
-    createTool('minecraft_verify_goal', 'Check the run success criterion against state received from the Minecraft server.', {}, async () => await bridgeRequest(run, 'verify_goal', { goal: run.goal })),
-    createTool('web_search', 'Read-only web search for Mineflayer, Minecraft, or pathfinder reference material.', { query: string('Search query, keep it focused'), max_results: optionalInt('Maximum result count', 1, 8) }, async (args) => await webSearch(args.query, args.max_results || 5)),
+    createTool('minecraft_observe', 'Read the current player, inventory, nearby entities and blocks from Mineflayer.', {}, async () => await bridgeRequest(run, 'observe'), run),
+    createTool('minecraft_verify_goal', 'Check the run success criterion against state received from the Minecraft server.', {}, async () => await bridgeRequest(run, 'verify_goal', { goal: run.goal }), run),
+    createTool('web_search', 'Read-only web search for Mineflayer, Minecraft, or pathfinder reference material.', { query: string('Search query, keep it focused'), max_results: optionalInt('Maximum result count', 1, 8) }, async (args) => await webSearch(args.query, args.max_results || 5), run),
   ];
   return tools;
 }
@@ -441,9 +532,41 @@ function imageInvariant(messages) {
 function summarizeAssistant(message) {
   const content = Array.isArray(message?.content) ? message.content : [];
   const text = content.filter((item) => item.type === 'text').map((item) => item.text).join('\n').slice(0, 20_000);
-  const reasoning = content.filter((item) => item.type === 'thinking' || item.type === 'reasoning').map((item) => item.thinking || item.text || '').join('\n').slice(0, 20_000);
   const toolCalls = content.filter((item) => item.type === 'toolCall').map((item) => ({ id: item.id, name: item.name, arguments: compactToolArguments(item.name, item.arguments || {}) }));
-  return { text, exposed_reasoning: reasoning || null, tool_calls: toolCalls };
+  return { text, error: message?.errorMessage || null, tool_calls: toolCalls };
+}
+
+function transcriptSnapshot(messages, maxCharacters = 120_000) {
+  let remaining = maxCharacters;
+  let truncated = (messages || []).length > 60;
+  const transcript = [];
+  for (const message of (messages || []).slice(-60)) {
+    const blocks = [];
+    const content = Array.isArray(message?.content)
+      ? message.content
+      : typeof message?.content === 'string' ? [{ type: 'text', text: message.content }] : [];
+    for (const item of content) {
+      if (item?.type === 'text' && typeof item.text === 'string') {
+        if (remaining <= 0) { truncated = true; break; }
+        const text = item.text.slice(0, remaining);
+        blocks.push({ type: 'text', text });
+        remaining -= text.length;
+        if (text.length < item.text.length) truncated = true;
+      } else if (item?.type === 'toolCall') {
+        const block = { type: 'tool_call', name: item.name, arguments: compactToolArguments(item.name, item.arguments || {}) };
+        const size = JSON.stringify(block).length;
+        if (size > remaining) { truncated = true; break; }
+        blocks.push(block);
+        remaining -= size;
+      } else if (item?.type === 'image') {
+        blocks.push({ type: 'image', label: 'Image content omitted; see the viewer frame' });
+      }
+      // Deliberately omit thinking/reasoning blocks; only user-visible text and actions belong in the trace.
+    }
+    if (blocks.length) transcript.push({ role: message.role || 'message', content: blocks });
+    if (remaining <= 0) { truncated = true; break; }
+  }
+  return { transcript, transcript_truncated: truncated };
 }
 
 function contextTextSegment(key, label, text, role = 'user') {
@@ -458,25 +581,45 @@ function contextTextSegment(key, label, text, role = 'user') {
   };
 }
 
-function subscribeTelemetry(session, runId, model, baseSegments) {
+function subscribeTelemetry(session, run, model, baseSegments, initialFrame) {
+  const runId = run.run_id;
   const requestTimes = new Map();
   const started = new Map();
   const requestContexts = new Map();
-  const reasoningBuffers = new Map();
-  const reasoningSent = new Map();
-  const lastReasoningPersist = new Map();
   let telemetryQueue = Promise.resolve();
+  let liveQueue = Promise.resolve();
+  let liveRequestId = null;
+  let liveTimer = null;
+  let pendingLiveText = '';
+  let liveActive = false;
   let imageAudit = null;
   const persist = (type, payload) => {
     telemetryQueue = telemetryQueue
       .then(() => rpc('agent_event', { run_id: runId, type, payload }))
       .catch((error) => emit('runtime_error', { message: errorText(error) }));
   };
+  const sendLive = (payload) => {
+    liveQueue = liveQueue
+      .then(() => rpc('agent_event', { run_id: runId, type: 'model_stream', payload }))
+      .catch((error) => emit('runtime_error', { message: errorText(error) }));
+  };
+  const flushLive = () => {
+    if (liveTimer) clearTimeout(liveTimer);
+    liveTimer = null;
+    if (!liveRequestId || !pendingLiveText) return;
+    const delta = pendingLiveText;
+    pendingLiveText = '';
+    sendLive({ request_id: liveRequestId, model: model.id, active: true, delta });
+  };
   const requestKey = (message) => String(message.id || message.timestamp || `request-${Date.now()}`);
-  const unsubscribe = session.subscribe((event) => {
+  const unsubscribeSession = session.subscribe((event) => {
     if (event.type === 'message_start' && event.message?.role === 'assistant') {
       const key = requestKey(event.message);
       started.set(key, performance.now());
+      liveRequestId = key;
+      pendingLiveText = '';
+      liveActive = true;
+      sendLive({ request_id: key, model: model.id, active: true, reset: true });
       const audit = imageInvariant(session.agent.state.messages);
       imageAudit = audit;
       emit('image_policy_check', { run_id: runId, ...audit });
@@ -485,7 +628,13 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
       const historyTokens = historyMessages.reduce((total, message) => {
         try { return total + estimateTokens(message); } catch { return total; }
       }, 0);
-      const segments = [...baseSegments];
+      const currentFrame = run.latestFrame || initialFrame;
+      const segments = baseSegments.filter((segment) => segment.key !== 'current_image');
+      segments.push({
+        key: 'current_image', label: 'Current first-person screenshot', kind: 'image', characters: 0,
+        estimated_tokens: estimateTokens({ role: 'user', content: [{ type: 'image' }] }),
+        preview: `${currentFrame.width}×${currentFrame.height} ${currentFrame.mime_type}; ${currentFrame.bytes} bytes; ${currentFrame.sha256}`,
+      });
       if (historyMessages.length) {
         segments.push({
           key: 'tool_round_history', label: 'Earlier messages and tool results', kind: 'history',
@@ -495,6 +644,7 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
       }
       const context = {
         request_id: key,
+        step_id: run.currentStepId ?? null,
         model: model.id,
         context_window: model.contextWindow || null,
         estimated_input_tokens: segments.reduce((sum, segment) => sum + (segment.estimated_tokens || 0), 0),
@@ -502,7 +652,9 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
         provider_input_tokens: null,
         segments,
         image_policy: audit,
+        current_frame: currentFrame,
         transcript_message_count: messages.length,
+        ...transcriptSnapshot(messages),
       };
       requestContexts.set(key, context);
       persist('model_context', context);
@@ -513,23 +665,9 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
         const key = requestKey(event.message);
         if (!requestTimes.has(key)) requestTimes.set(key, performance.now());
       }
-      if (kind === 'thinking_delta') {
-        const key = requestKey(event.message);
-        const delta = event.assistantMessageEvent?.delta ?? event.assistantMessageEvent?.text ?? '';
-        if (typeof delta === 'string' && delta) {
-          const previous = reasoningBuffers.get(key) || '';
-          const combined = `${previous}${delta}`;
-          const visible = combined.length > 20_000 ? combined.slice(-20_000) : combined;
-          reasoningBuffers.set(key, visible);
-          const lastSent = reasoningSent.get(key) || 0;
-          const lastPersist = lastReasoningPersist.get(key) || 0;
-          if (visible.length > lastSent && performance.now() - lastPersist >= 1000) {
-            const chunk = visible.slice(lastSent);
-            reasoningSent.set(key, visible.length);
-            lastReasoningPersist.set(key, performance.now());
-            persist('reasoning_update', { request_id: key, delta: chunk, cumulative_characters: visible.length, complete: false, visibility: 'provider-exposed only' });
-          }
-        }
+      if (kind === 'text_delta' && typeof event.assistantMessageEvent?.delta === 'string') {
+        pendingLiveText += event.assistantMessageEvent.delta;
+        if (!liveTimer) liveTimer = setTimeout(flushLive, 120);
       }
     }
     if (event.type === 'message_end' && event.message?.role === 'assistant') {
@@ -543,16 +681,9 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
       const context = requestContexts.get(key);
       const inputTokens = usage.input ?? null;
       const outputTokens = usage.output ?? null;
-      const streamedReasoning = reasoningBuffers.get(key) || '';
-      const exposedReasoning = summary.exposed_reasoning || streamedReasoning || null;
-      const sentLength = reasoningSent.get(key) || 0;
-      if (exposedReasoning && exposedReasoning.length > sentLength) {
-        persist('reasoning_update', { request_id: key, delta: exposedReasoning.slice(sentLength), cumulative_characters: exposedReasoning.length, complete: true, visibility: 'provider-exposed only' });
-      } else if (exposedReasoning) {
-        persist('reasoning_update', { request_id: key, delta: '', cumulative_characters: exposedReasoning.length, complete: true, visibility: 'provider-exposed only' });
-      }
       const payload = {
         run_id: runId,
+        step_id: run.currentStepId ?? null,
         request_id: key,
         provider: message.provider || null,
         model: message.model || null,
@@ -579,7 +710,7 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
         context_utilization_percent: inputTokens !== null && model.contextWindow ? Number((inputTokens / model.contextWindow * 100).toFixed(4)) : null,
         context_estimate_method: context?.estimate_method || null,
         estimated_input_tokens: context?.estimated_input_tokens ?? null,
-        reasoning_visibility: summary.exposed_reasoning === null ? 'provider did not expose reasoning summary' : 'provider-exposed summary only',
+        reasoning_visibility: 'private reasoning omitted; visible response and tool actions are recorded',
       };
       if (context) {
         context.provider_input_tokens = inputTokens;
@@ -587,58 +718,54 @@ function subscribeTelemetry(session, runId, model, baseSegments) {
         context.context_utilization_percent = payload.context_utilization_percent;
       }
       persist('model_message', payload);
+      flushLive();
+      if (liveRequestId === key && liveActive) {
+        liveActive = false;
+        sendLive({ request_id: key, active: false });
+      }
       started.delete(key);
       requestTimes.delete(key);
       requestContexts.delete(key);
-      reasoningBuffers.delete(key);
-      reasoningSent.delete(key);
-      lastReasoningPersist.delete(key);
     }
     if (event.type === 'tool_execution_start') {
-      const payload = { run_id: runId, tool_call_id: event.toolCallId, tool: event.toolName, arguments: compactToolArguments(event.toolName, event.args || {}) };
+      const payload = { run_id: runId, step_id: run.currentStepId ?? null, tool_call_id: event.toolCallId, tool: event.toolName, arguments: compactToolArguments(event.toolName, event.args || {}) };
       void rpc('agent_event', { run_id: runId, type: 'tool_call_started', payload }).catch(() => {});
+      void rpc('agent_event', {
+        run_id: runId,
+        type: 'rl_tool_action',
+        payload: { run_id: runId, step_id: run.currentStepId ?? null, tool_call_id: event.toolCallId, tool: event.toolName, arguments: traceValue(event.args || {}) },
+      }).catch(() => {});
     }
     if (event.type === 'tool_execution_end') {
-      const payload = { run_id: runId, tool_call_id: event.toolCallId, tool: event.toolName, is_error: event.isError, duration_ms: event.durationMs ?? null, result: safeToolText(event.result, 12_000) };
+      const payload = { run_id: runId, step_id: run.currentStepId ?? null, tool_call_id: event.toolCallId, tool: event.toolName, is_error: event.isError, duration_ms: event.durationMs ?? null, result: safeToolText(event.result, 12_000) };
+      if (event.toolName === 'minecraft_observe') payload.player_health = playerHealthFromToolResult(event.result);
       void rpc('agent_event', { run_id: runId, type: 'tool_call_finished', payload }).catch(() => {});
     }
   });
-  return unsubscribe;
+  return async () => {
+    unsubscribeSession();
+    flushLive();
+    if (liveRequestId && liveActive) {
+      liveActive = false;
+      sendLive({ request_id: liveRequestId, active: false });
+    }
+    await Promise.all([telemetryQueue, liveQueue]);
+  };
 }
 
 async function captureScreenshot(run) {
   const media = path.join(run.run_directory, 'media', 'frames');
-  await fs.mkdir(media, { recursive: true, mode: 0o700 });
-  await fs.mkdir(run.chrome_home || '/tmp', { recursive: true, mode: 0o700 });
-  const index = ++run.frameSequence;
+  const index = (frameSequences.get(run.run_id) || 0) + 1;
+  frameSequences.set(run.run_id, index);
+  run.frameSequence = index;
   const filename = `frame-${String(index).padStart(6, '0')}.png`;
   const target = path.join(media, filename);
-  const chrome = process.env.MINECRAFT_CHROME || 'google-chrome';
-  const argv = [
-    '--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking',
-    '--hide-scrollbars', '--enable-webgl', '--use-gl=angle', '--use-angle=swiftshader',
-    '--window-size=384,216', '--virtual-time-budget=2500', `--screenshot=${target}`,
-    run.viewer_url,
-  ];
-  const begin = performance.now();
-  await new Promise((resolve, reject) => {
-    const child = spawn(chrome, argv, { stdio: ['ignore', 'ignore', 'pipe'], env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: run.chrome_home || '/tmp' } });
-    let tail = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Prismarine Viewer screenshot exceeded 30 seconds')); }, 30_000);
-    child.stderr.on('data', (chunk) => { tail = (tail + chunk.toString()).slice(-1500); });
-    child.once('error', (error) => { clearTimeout(timer); reject(error); });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      if (code !== 0) reject(new Error(`headless browser exited ${code}: ${tail.slice(-700)}`));
-      else resolve();
-    });
-  });
-  const image = await fs.readFile(target);
-  if (image.length < 500 || image.subarray(1, 4).toString('ascii') !== 'PNG') throw new Error('Prismarine Viewer returned an empty or invalid PNG');
-  const metadata = { path: `media/frames/${filename}`, mime_type: 'image/png', width: 384, height: 216, bytes: image.length, sha256: sha256(image), capture_ms: Math.round(performance.now() - begin), renderer: 'Prismarine Viewer 1.33.0 first-person WebGL screenshot' };
+  const frame = await captureViewerImage({ viewerUrl: run.viewer_url, target, chromeHome: run.chrome_home || '/tmp' });
+  const metadata = { path: `media/frames/${filename}`, mime_type: 'image/png', ...frame.audit, bytes: frame.image.length, sha256: frame.sha256, capture_ms: frame.capture_ms, renderer: 'Prismarine Viewer 1.33.0 first-person WebGL screenshot', step_id: run.currentStepId ?? null };
   await rpc('agent_event', { run_id: run.run_id, type: 'viewer_frame', payload: metadata });
   emit('viewer_frame', { run_id: run.run_id, ...metadata });
-  return { image, metadata };
+  run.latestFrame = metadata;
+  return { image: frame.image, metadata };
 }
 
 function compactObservation(observation) {
@@ -668,10 +795,11 @@ async function readWorkspaceText(run, file) {
 }
 
 async function performTurn(run, model, { probe = false } = {}) {
+  run.currentStepId = probe ? null : run.turns + 1;
+  run.currentStep = probe ? null : { step_id: run.currentStepId, tool_calls: [] };
   const observation = await bridgeRequest(run, 'observe');
   const goalResult = await bridgeRequest(run, 'verify_goal', { goal: run.goal });
   const frame = await captureScreenshot(run);
-  const image = { type: 'image', data: frame.image.toString('base64'), mimeType: 'image/png' };
   const files = probe ? { plan: '', memory: '' } : await Promise.all([readWorkspaceText(run, 'plan.md'), readWorkspaceText(run, 'memory.md')]).then(([plan, memory]) => ({ plan, memory }));
   const systemPrompt = systemPromptFor(run);
   const systemPromptHash = sha256(Buffer.from(systemPrompt));
@@ -709,27 +837,50 @@ async function performTurn(run, model, { probe = false } = {}) {
       preview: `${frame.metadata.width}×${frame.metadata.height} ${frame.metadata.mime_type}; ${frame.metadata.bytes} bytes; ${frame.metadata.sha256}`,
     },
   ];
-  const unsubscribe = subscribeTelemetry(session, run.run_id, model, contextSegments);
-  await rpc('agent_event', { run_id: run.run_id, type: probe ? 'model_probe_request' : 'agent_turn_started', payload: { model: model.id, screenshot: frame.metadata, image_count: 1, image_position: 'last item in the current user message', prior_images_in_context: 0, system_prompt_sha256: systemPromptHash, tool_schema_sha256: toolSchemaHash } });
+  const unsubscribe = subscribeTelemetry(session, run, model, contextSegments, frame.metadata);
+  await rpc('agent_event', { run_id: run.run_id, type: probe ? 'model_probe_request' : 'agent_turn_started', payload: { step_id: run.currentStepId, model: model.id, observation: probe ? undefined : observation, verified_goal: probe ? undefined : goalResult, screenshot: frame.metadata, image_count: 1, image_position: 'last item in the current user message', prior_images_in_context: 0, system_prompt_sha256: systemPromptHash, tool_schema_sha256: toolSchemaHash } });
   try {
-    await session.prompt(task, { images: [image], source: 'rpc' });
+    await handoffViewerImage(session, task, frame);
   } finally {
-    unsubscribe();
-    run.lastSessionMessages = [...session.agent.state.messages];
+    await unsubscribe();
+    const assistantMessages = (session.agent.state.messages || []).filter((message) => message.role === 'assistant');
+    run.lastAssistantSummaries = assistantMessages.map(summarizeAssistant);
+    run.lastTurnActions = assistantMessages.flatMap((message) => (message.content || [])
+      .filter((item) => item.type === 'toolCall')
+      .map((item) => ({ tool_call_id: item.id, tool: item.name, arguments: traceValue(item.arguments || {}) })));
     session.dispose();
     if (run.session === session) run.session = null;
   }
   const after = await bridgeRequest(run, 'verify_goal', { goal: run.goal });
-  const assistantMessages = (run.lastSessionMessages || []).filter((message) => message.role === 'assistant');
-  const lastAssistant = assistantMessages.at(-1);
-  const lastSummary = summarizeAssistant(lastAssistant);
+  const assistantMessages = run.lastAssistantSummaries || [];
+  const lastSummary = assistantMessages.at(-1) || { text: '', tool_calls: [] };
   const summary = {
     ...lastSummary,
-    exposed_reasoning: assistantMessages.map((message) => summarizeAssistant(message).exposed_reasoning).filter(Boolean).join('\n').slice(0, 20_000) || null,
-    tool_calls: assistantMessages.flatMap((message) => summarizeAssistant(message).tool_calls),
+    tool_calls: assistantMessages.flatMap((message) => message.tool_calls),
   };
-  if (lastAssistant?.errorMessage) throw new Error(lastAssistant.errorMessage);
+  if (lastSummary.error) throw new Error(lastSummary.error);
   if (!probe) {
+    await rpc('agent_event', {
+      run_id: run.run_id,
+      type: 'agent_transition',
+      payload: {
+        step_id: run.currentStepId,
+        observation: traceValue(observation),
+        verified_goal_before: traceValue(goalResult),
+        screenshot: frame.metadata,
+        actions: run.lastTurnActions || [],
+        tool_calls: run.currentStep?.tool_calls || [],
+        next_observation: null,
+        verified_goal_after: traceValue(after),
+        reward: after.status === 'passed' ? 1.0 : 0.0,
+        terminated: after.status === 'passed',
+        token_ids: null,
+        token_logprobs: null,
+        token_metrics_status: 'not_exposed_by_pi_bridge',
+      },
+    });
+    run.currentStep = null;
+    run.currentStepId = null;
     const frameSummary = `turn ${run.turns}: position=${JSON.stringify(observation.player?.position || null)}, inventory=${JSON.stringify(observation.inventory_summary || {})}, goal=${after.status}, assistant=${summary.text.slice(0, 500)}`;
     run.frameSummaries.push(frameSummary);
     if (run.frameSummaries.length > 12) run.frameSummaries.shift();
@@ -740,7 +891,7 @@ async function performTurn(run, model, { probe = false } = {}) {
 
 async function probeModel(params) {
   const selection = await accountModels();
-  if (!selection.chosen) throw new Error('No account-accessible Pi model supports image input.');
+  if (!selection.chosen) throw new Error('No configured Pi model supports image input.');
   const run = {
     run_id: params.run_id,
     kind: params.kind,
@@ -755,7 +906,7 @@ async function probeModel(params) {
     frameSummaries: [],
     turns: 0,
   };
-  const model = applySupportedContext((await runtime()).getModel('openai', selection.chosen.id));
+  const model = applySupportedContext((await runtime()).getModel(selection.chosen.provider, selection.chosen.id));
   if (!model || !model.reasoning || !model.input?.includes('image')) throw new Error(`Pi has no compatible model metadata for ${selection.chosen.id}`);
   const outcome = await performTurn(run, model, { probe: true });
   const toolWorked = outcome.assistant.tool_calls?.some((call) => call.name === 'probe_complete');
@@ -770,8 +921,8 @@ async function runAgent(run) {
   try {
     const selected = await accountModels();
     const metadata = run.model_id ? selected.candidates.find((candidate) => candidate.id === run.model_id) : selected.chosen;
-    if (!metadata) throw new Error('No signed-in account model satisfies the image-input and reasoning requirements.');
-    const model = applySupportedContext((await runtime()).getModel('openai', metadata.id));
+    if (!metadata) throw new Error('No configured model satisfies the image-input and reasoning requirements.');
+    const model = applySupportedContext((await runtime()).getModel(metadata.provider, metadata.id));
     if (!model) throw new Error(`Pi model metadata is missing for ${metadata.id}`);
     run.model_id = model.id;
     emit('agent_model_selected', { run_id: run.run_id, model: modelMetadata(model) });
@@ -818,7 +969,8 @@ async function runAgent(run) {
   } finally {
     const elapsedMs = activeMillis + (activeSince === null ? 0 : Date.now() - activeSince);
     await bridgeRequest(run, 'release_controls').catch(() => {});
-    await rpc('agent_run_finished', { run_id: run.run_id, status: endState, active_elapsed_seconds: Math.round(elapsedMs / 1000), turns: run.turns }).catch(() => {});
+    const finalObservation = await bridgeRequest(run, 'observe').catch(() => null);
+    await rpc('agent_run_finished', { run_id: run.run_id, status: endState, active_elapsed_seconds: Math.round(elapsedMs / 1000), turns: run.turns, final_observation: traceValue(finalObservation) }).catch(() => {});
     emit('agent_run_finished', { run_id: run.run_id, status: endState, active_elapsed_seconds: Math.round(elapsedMs / 1000), turns: run.turns });
     if (currentRun === run) currentRun = null;
   }
@@ -826,6 +978,9 @@ async function runAgent(run) {
 
 async function handle(method, params) {
   if (method === 'status') return { status: 'ready', auth: await authStatus(), active_run_id: currentRun?.run_id || null, active_run_state: currentRun ? (currentRun.paused ? 'paused' : currentRun.stopped ? 'stopping' : 'running') : null };
+  if (localModelSettings() && ['auth_start', 'auth_callback', 'pin_default_model', 'logout'].includes(method)) {
+    throw new Error('OAuth and remote model selection are disabled for the Molab local inference runtime.');
+  }
   if (method === 'auth_start') return startLogin();
   if (method === 'auth_callback') {
     if (!loginCallback) throw new Error('No ChatGPT sign-in callback is waiting.');
@@ -854,7 +1009,7 @@ async function handle(method, params) {
   if (method === 'pause_run') {
     if (!currentRun || currentRun.run_id !== params.run_id) throw new Error('active Pi run not found');
     currentRun.paused = true;
-    await currentRun.session?.abort?.();
+    requestSessionAbort(currentRun);
     return { status: 'pause_requested' };
   }
   if (method === 'resume_run') {
@@ -866,14 +1021,14 @@ async function handle(method, params) {
     if (!currentRun || currentRun.run_id !== params.run_id) return { status: 'already_stopped' };
     currentRun.stopped = true;
     currentRun.paused = false;
-    await currentRun.session?.abort?.();
+    requestSessionAbort(currentRun);
     return { status: 'stop_requested' };
   }
   if (method === 'shutdown') {
     shuttingDown = true;
     if (currentRun) {
       currentRun.stopped = true;
-      await currentRun.session?.abort?.();
+      requestSessionAbort(currentRun);
     }
     loginController?.abort();
     return { status: 'shutting_down' };

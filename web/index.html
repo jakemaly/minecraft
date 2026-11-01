@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Minecraft Agent</title>
+  <script>
+    try {
+      const savedTheme = localStorage.getItem('minecraft-agent-theme');
+      const theme = savedTheme || 'dark';
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.dataset.webtuiTheme = theme;
+    } catch {
+      document.documentElement.dataset.theme = 'dark';
+      document.documentElement.dataset.webtuiTheme = 'dark';
+    }
+  </script>
+  <style>@layer base, utils, components;</style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@webtui/css@0.1.10/dist/base.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@webtui/css@0.1.10/dist/components/pre.css">
+  <style>
+    @font-face { font-family: Monocraft; src: url('https://cdn.jsdelivr.net/gh/IdreesInc/Monocraft@v4.2.1/dist/Monocraft-ttf/Monocraft.ttf') format('truetype'); font-display: swap; }
+    :root[data-theme="dark"] {
+      color-scheme: dark; --bg:#121613; --panel:#171c18; --text:#e1e6de; --muted:#99a396; --line:#38423b;
+      --hover:#202a22; --green:#a6d494; --blue:#9bcbd2; --red:#ed9a8e; --viewer:#0b0f0c;
+      --output:#bac4b7; --trace-bg:#222321; --trace-plan:#303039; --trace-tool:#233528;
+      --background0:var(--bg); --background1:#303039; --background2:#233528; --background3:#38423b;
+      --foreground0:var(--text); --foreground1:var(--output); --foreground2:var(--muted); --box-border-color:var(--line); --pre-background:transparent;
+    }
+    :root[data-theme="light"] {
+      color-scheme:light; --bg:#f4f3ee; --panel:#ebece6; --text:#20251f; --muted:#727970; --line:#d3d8cf;
+      --hover:#e3e7df; --green:#477746; --blue:#426c75; --red:#a24e44; --viewer:#111411;
+      --output:#5e665c; --trace-bg:#e8e9e6; --trace-plan:#e3e4e9; --trace-tool:#e1e9df;
+      --background0:var(--bg); --background1:#e4e5e0; --background2:#dce7dc; --background3:#cbd8cb;
+      --foreground0:var(--text); --foreground1:#5e665c; --foreground2:var(--muted); --box-border-color:var(--line); --pre-background:transparent;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; min-width:900px; height:100vh; height:100dvh; overflow:hidden; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,sans-serif; transition:background-color .18s,color .18s; }
+    button,select,input { font:inherit; color:inherit; }
+    button { min-height:30px; padding:4px 8px; border:0; border-radius:2px; background:transparent; color:var(--text); cursor:pointer; }
+    button:hover { background:var(--hover); }
+    button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible { outline:2px solid var(--green); outline-offset:2px; }
+    button:disabled { opacity:.42; cursor:not-allowed; }
+    button.primary { padding-inline:12px; background:var(--green); color:var(--bg); font-weight:650; }
+    button.primary:hover { filter:brightness(.94); }
+    button.danger { color:var(--red); }
+    select,input { min-height:30px; padding:4px 6px; border:0; border-bottom:1px solid var(--line); border-radius:0; background:transparent; }
+    a { color:var(--blue); }
+    [hidden] { display:none !important; }
+    .app { width:100%; height:100%; margin:0 auto; padding:18px 28px 24px; display:grid; grid-template-rows:auto minmax(0,1fr); }
+    .topbar { display:flex; align-items:center; gap:18px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+    .topbar .context-tabs { align-self:stretch; align-items:flex-end; margin:0 0 -14px auto; border-bottom:0; }
+    .brand h1 { margin:0; font-size:21px; line-height:1.25; font-weight:620; letter-spacing:-.025em; }
+    .brand p { display:flex; align-items:center; gap:5px; margin:4px 0 0; color:var(--muted); font-size:12px; }
+    .brand #task { min-height:24px; width:auto; max-width:220px; padding:1px 18px 1px 0; color:var(--text); font:12px system-ui,sans-serif; }
+    .connection,.auth { display:flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0; }
+    .connection { gap:7px; color:var(--muted); font:inherit; white-space:nowrap; }
+    .connection-summary::before { margin-right:7px; content:"·"; color:var(--muted); }
+    .auth { justify-content:flex-start; gap:12px; }
+    .auth-status,.model-empty { color:var(--muted); font-size:inherit; white-space:nowrap; }
+    .auth a,.auth button { font:inherit; }
+    .auth input { width:180px; min-width:150px; font:inherit; }
+    .auth #connect { padding-inline:0; color:var(--muted); }
+    .auth #connect:hover { background:transparent; color:var(--text); }
+    #model-slot { min-width:0; width:min(100%,280px); }
+    #model-slot #model-picker { width:100%; max-width:100%; }
+    .error { display:none; position:absolute; z-index:4; top:90px; left:28px; right:28px; padding:8px 10px; border-left:2px solid var(--red); background:var(--panel); color:var(--red); }
+    .studio-layout { min-height:0; display:grid; grid-template-columns:minmax(0,2fr) minmax(340px,1fr); gap:24px; overflow:hidden; }
+    .stage-column { min-width:0; min-height:0; display:flex; flex-direction:column; padding-top:16px; }
+    .context-column { min-width:0; min-height:0; display:flex; flex-direction:column; padding:16px 0 0; }
+    .agent-under-viewer { display:grid; grid-template-columns:minmax(0,1fr); justify-items:center; gap:4px; width:100%; margin-top:8px; }
+    .agent-under-viewer .agent-card,.agent-under-viewer .mission { width:100%; }
+    .agent-card { display:grid; grid-template-columns:180px minmax(0,1fr); align-items:center; gap:8px 18px; min-width:0; padding:8px 0 4px; font:14px/1.45 system-ui,sans-serif; }
+    .agent-stage { display:grid; width:100%; height:180px; place-items:center; overflow:hidden; }
+    .steve { display:block; height:172px; width:auto; object-fit:contain; image-rendering:pixelated; transform-origin:50% 85%; }
+    .agent-card[data-mode="thinking"] .steve { animation:thinking 2.5s ease-in-out infinite; }
+    .agent-card[data-mode="acting"] .steve { animation:acting .55s ease-in-out infinite alternate; }
+    .agent-card[data-mode="walking"] .steve { animation:walking .4s ease-in-out infinite alternate; }
+    .activity-block { display:grid; align-content:center; justify-items:start; gap:10px; min-width:0; }
+    .activity-line { display:flex; align-items:center; justify-content:flex-start; gap:7px; }
+    .activity-line::before { width:7px; height:7px; flex:0 0 7px; content:""; border-radius:50%; background:var(--muted); }
+    .agent-card[data-mode="thinking"] .activity-line::before,.agent-card[data-mode="acting"] .activity-line::before,.agent-card[data-mode="walking"] .activity-line::before { background:var(--green); }
+    .activity-line h3 { display:inline-block; max-width:100%; margin:0; padding:4px 8px; border-radius:2px; background:var(--trace-tool); color:var(--green); font:600 14px/1.3 system-ui,sans-serif; overflow-wrap:anywhere; }
+    .agent-card[data-mode="idle"] .activity-line h3 { background:transparent; color:var(--muted); padding-left:0; }
+    .mission { min-width:0; margin:0 0 10px; color:var(--muted); font:13px/1.45 system-ui,sans-serif; overflow-wrap:break-word; word-break:normal; }
+    .mission-text { margin:0; overflow-wrap:break-word; word-break:normal; }
+    .agent-controls { display:grid; gap:5px; margin:0 0 8px; font:13px/1.4 system-ui,sans-serif; }
+    .workspace-panel { min-height:0; flex:1; display:flex; flex-direction:column; margin-top:8px; overflow:hidden; color:var(--text); font:11px/1.55 Monocraft,monospace; }
+    .workspace-heading { display:flex; justify-content:space-between; gap:10px; padding:8px 2px; color:var(--green); white-space:nowrap; }
+    .workspace-count,.workspace-message { color:var(--muted); }
+    .workspace-tree { min-height:0; flex:1; overflow:auto; padding:4px 0 12px; color:var(--text); scrollbar-color:var(--line) var(--bg); }
+    .workspace-tree details { margin:0; }
+    .workspace-tree summary { min-height:25px; padding:3px 7px; color:var(--text); cursor:pointer; overflow-wrap:anywhere; }
+    .workspace-tree details[data-active="true"]>summary { background:var(--trace-tool); color:var(--green); }
+    .workspace-tree summary::marker { color:var(--green); }
+    .workspace-tree summary:hover,.workspace-file:hover { background:var(--hover); }
+    .workspace-children { margin-left:13px; padding-left:8px; border-left:1px solid var(--line); }
+    .workspace-file { display:flex; gap:7px; min-height:25px; padding:3px 7px; color:var(--text); overflow-wrap:anywhere; }
+    .workspace-file-glyph { color:var(--muted); flex:0 0 auto; }
+    .workspace-file[data-active="true"] { background:var(--trace-tool); color:var(--green); box-shadow:inset 2px 0 var(--green); }
+    .workspace-file[data-active="true"] .workspace-file-glyph { color:var(--green); }
+    .workspace-message { padding:8px 2px; }
+    .stage-column .playback-panel { display:flex; flex-direction:column; flex:0 0 auto; }
+    .playback-meta { min-width:0; display:flex; align-items:center; flex-wrap:wrap; gap:5px 18px; padding:8px 2px 0; }
+    .context-tabs { display:flex; align-items:center; gap:18px; flex:0 0 auto; }
+    .context-tab { min-height:34px; padding:5px 2px; border-bottom:2px solid transparent; border-radius:0; color:var(--muted); font:12px system-ui,sans-serif; }
+    .context-tab[aria-selected="true"] { border-bottom-color:var(--green); color:var(--text); }
+    .context-tab:hover { background:transparent; color:var(--text); }
+    .trace-panel { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; background:var(--trace-bg); color:var(--text); }
+    .trace-head { display:flex; align-items:center; justify-content:flex-end; flex:0 0 36px; padding:6px 16px; border-bottom:1px solid var(--line); background:var(--bg); color:var(--muted); font:11px system-ui,sans-serif; }
+    .trace { min-height:0; flex:1; overflow:auto; padding:8px 16px 16px; background:var(--trace-bg); color:var(--text); font:12px/1.65 Monocraft,monospace; scrollbar-color:var(--line) var(--trace-bg); }
+    .trace-event { margin:0; padding:12px 3px; border:0; background:transparent; overflow-wrap:anywhere; }
+    .trace-event+.trace-event { margin-top:12px; }
+    .trace-event.message { padding:0; }
+    .trace-plan { padding:14px 16px; background:var(--trace-plan); color:var(--text); white-space:pre-wrap; }
+    .trace-tool { padding:14px 16px; border-left:2px solid #52634f; background:var(--trace-tool); color:var(--text); }
+    .trace-meta { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:5px; color:var(--muted); font-size:10px; }
+    .trace-kind { color:var(--green); }
+    .trace-time { white-space:nowrap; }
+    .trace-command { margin:0; padding:0; border:0; background:transparent; color:var(--text); white-space:pre-wrap; font:inherit; font-weight:700; }
+    .trace-command .prompt { color:var(--green); }
+    .trace-command-args { font-weight:400; }
+    .trace-text { --pre-background:transparent; margin:5px 0 0; color:var(--text); white-space:pre-wrap; overflow-wrap:anywhere; }
+    .trace-output { --pre-background:transparent; max-height:320px; overflow:auto; margin:10px 0 0; color:var(--output); white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
+    .trace-output.error-text { color:var(--red); }
+    .trace-tool .trace-meta { margin:9px 0 0; color:var(--muted); }
+    .trace-metrics { margin-top:7px; color:var(--muted); font-size:10px; }
+    .trace-live { padding:12px 3px; }
+    .trace-live .trace-text { white-space:pre-wrap; }
+    .stream-cursor { display:inline-block; margin-left:3px; color:var(--green); animation:cursor-blink 1s steps(2,start) infinite; }
+    @keyframes cursor-blink { to { visibility:hidden; } }
+    .trace-details { margin-top:5px; }
+    .trace-details summary { padding:4px 0; color:var(--muted); cursor:pointer; }
+    .trace-details summary:hover { color:var(--text); }
+    .trace-segment { margin:7px 0; padding-left:12px; border-left:1px solid var(--line); }
+    .trace-segment strong { display:block; color:var(--blue); font-size:10px; font-weight:500; }
+    .trace-segment pre { --pre-background:transparent; max-height:260px; overflow:auto; margin:4px 0 0; color:var(--output); white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
+    .trace-message { margin:7px 0; }
+    .trace-role { color:var(--blue); font-size:10px; }
+    .trace-image { display:block; max-width:min(100%,540px); max-height:300px; margin-top:8px; image-rendering:pixelated; }
+    .load-more { display:block; margin:4px 0 10px; padding:4px 0; color:var(--blue); }
+    .trace-empty { padding:28px 0; color:var(--muted); }
+    .viewer { position:relative; width:100%; height:auto; aspect-ratio:384 / 216; overflow:hidden; background:var(--viewer); }
+    .viewer iframe { display:block; width:100%; height:100%; border:0; }
+    .viewer-empty { display:grid; width:100%; height:100%; place-items:center; padding:22px; color:#adb5a9; text-align:center; font:12px/1.6 system-ui,sans-serif; }
+    .health-row { display:flex; align-items:center; gap:8px; min-height:28px; padding:6px 2px; }
+    .health-label { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+    .hearts { display:flex; align-items:center; gap:1px; }
+    .heart { width:14px; height:14px; image-rendering:pixelated; }
+    .health-value { margin-left:auto; color:var(--muted); font:11px system-ui,sans-serif; }
+    .facts { display:flex; flex-wrap:wrap; gap:4px 14px; margin:0; padding:0; color:var(--muted); font:12px/1.5 system-ui,sans-serif; overflow-wrap:anywhere; }
+    .facts span { max-width:100%; }
+    .run-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-width:0; }
+    .dot { display:inline-block; width:7px; height:7px; margin-right:4px; border-radius:50%; background:var(--muted); }
+    .dot.ready,.switch-dot { background:var(--green); }
+    .run-state { display:inline-flex; align-items:center; gap:7px; margin-right:4px; color:var(--muted); white-space:nowrap; font:13px/1.4 system-ui,sans-serif; }
+    .run-state::before { width:6px; height:6px; flex:0 0 6px; content:""; border-radius:50%; background:currentColor; opacity:.72; }
+    .run-state.ready { color:var(--green); }
+    .playback-meta .run-actions { margin-left:auto; }
+    .run-actions button { min-height:32px; padding:5px 10px; font:13px system-ui,sans-serif; }
+    .run-actions #export { color:var(--muted); }
+    .run-actions #export:hover { color:var(--text); }
+    .theme-toggle { display:flex; align-items:center; gap:8px; width:116px; justify-content:space-between; margin-top:auto; padding:8px 2px 0; text-align:left; color:var(--text); font:12px system-ui,sans-serif; }
+    .switch-track { display:flex; width:28px; height:15px; justify-content:flex-end; align-items:center; padding:2px; background:var(--trace-tool); }
+    .switch-dot { display:block; width:11px; height:11px; background:url("assets/dark-theme-enabled.svg") center/contain no-repeat; }
+    :root[data-theme="light"] .switch-track { justify-content:flex-start; background:var(--line); }
+    :root[data-theme="light"] .switch-dot { filter:grayscale(1); }
+    @keyframes thinking { 50% { transform:translateY(-5px) rotate(-1deg); } }
+    @keyframes acting { to { transform:translateY(-3px) rotate(2deg); } }
+    @keyframes walking { to { transform:translateY(-2px); } }
+    @media (max-width:1100px) {
+      .app { padding:16px 18px 20px; }
+      .studio-layout { grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr); gap:18px; }
+      .agent-card { grid-template-columns:156px minmax(0,1fr); gap:8px 14px; }
+      .steve { height:148px; }
+      .agent-stage { height:156px; }
+      .error { left:18px; right:18px; }
+    }
+    @media (max-width:760px) {
+      body { min-width:0; overflow:auto; }
+      .app { min-height:100dvh; height:auto; grid-template-rows:auto auto; }
+      .topbar { align-items:flex-start; flex-wrap:wrap; }
+      .topbar .context-tabs { width:100%; margin:0; }
+      .studio-layout { grid-template-columns:minmax(0,1fr); overflow:visible; }
+      .context-column { min-height:560px; border-left:0; border-top:1px solid var(--line); padding:12px 0 0; }
+      .stage-column { overflow:visible; }
+      .agent-card { grid-template-columns:136px minmax(0,1fr); gap:8px 12px; }
+      .steve { height:128px; }
+      .agent-stage { height:136px; }
+      .theme-toggle { margin-top:16px; }
+    }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; animation-duration:.01ms!important; animation-iteration-count:1!important; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand"><h1>Minecraft Agent</h1><p><span>Goal:</span>
+        <select id="task" aria-label="Choose a goal">
+          <option value="diamond_pilot">Get a diamond</option>
+          <option value="dragon_proof">Defeat the Ender Dragon</option>
+        </select>
+      </p></div>
+      <div class="context-tabs" role="tablist" aria-label="Agent details">
+        <button id="conversation-tab" class="context-tab" type="button" role="tab" aria-controls="trace-panel" aria-selected="true">Conversation</button>
+        <button id="workspace-tab" class="context-tab" type="button" role="tab" aria-controls="workspace-panel" aria-selected="false">Workspace</button>
+      </div>
+    </header>
+
+    <div id="error" class="error" role="alert"></div>
+
+    <section class="studio-layout" id="studio">
+      <section class="stage-column" aria-label="Minecraft world">
+        <div class="playback-panel">
+          <div class="viewer" id="viewer"><div class="viewer-empty">Start a run to open the live first-person world view.</div></div>
+          <div class="playback-meta">
+            <div class="health-row" aria-label="Player health">
+              <span class="health-label">Health</span>
+              <div class="hearts" id="hearts" role="img" aria-label="Health not yet observed"></div>
+              <span class="health-value" id="health-value">— / 20</span>
+            </div>
+            <div class="run-actions">
+              <span id="run-state" class="run-state">No run</span>
+              <button id="start" class="primary">Start</button>
+              <button id="pause" hidden>Pause</button>
+              <button id="resume" hidden>Resume</button>
+              <button id="stop" class="danger" hidden>Stop</button>
+              <button id="export" hidden>Export</button>
+              <a id="download" hidden>Download</a>
+            </div>
+          </div>
+        </div>
+        <section class="agent-under-viewer" aria-label="Agent state and task">
+          <section class="agent-card" id="agent-card" data-mode="idle" aria-label="Agent state">
+            <div class="agent-stage"><img id="steve" class="steve" src="https://skinrender.dev/render/steve/body?size=384" alt="Steve standing"></div>
+            <div class="activity-block">
+              <div class="activity-line" id="activity-line" hidden><h3 id="activity">Waiting for a run</h3></div>
+              <div id="model-slot"><span class="model-empty">Loading…</span></div>
+              <div class="agent-controls">
+                <div class="auth" id="auth">
+                  <span id="service" class="connection" aria-live="polite"><span class="dot"></span><span>Offline</span><span class="connection-summary">ChatGPT not connected</span></span>
+                  <button id="connect">Connect</button>
+                  <a id="login-link" hidden target="_blank" rel="noopener">Continue sign-in</a>
+                  <input id="callback" hidden aria-label="OAuth callback URL" placeholder="Paste callback URL">
+                  <button id="submit-callback" hidden>Finish sign-in</button>
+                </div>
+              </div>
+            </div>
+          </section>
+          <div class="mission"><p class="mission-text" id="objective">Your task is to have at least one diamond in your inventory.</p></div>
+          <div class="facts" id="facts" aria-label="Run, seed and elapsed time"></div>
+        </section>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch color theme"><span id="theme-label">Dark</span><span class="switch-track"><span class="switch-dot"></span></span></button>
+      </section>
+
+      <aside class="context-column" aria-label="Conversation, workspace and controls">
+        <section class="trace-panel" id="trace-panel" role="tabpanel" aria-labelledby="conversation-tab" aria-label="Conversation and activity">
+          <div class="trace-head"><span id="trace-count"></span></div>
+          <div class="trace" id="timeline" aria-label="Conversation and activity trace" aria-live="polite">
+            <div class="trace-empty">The run transcript will appear here.</div>
+          </div>
+        </section>
+        <section class="workspace-panel" id="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab" aria-label="Agent workspace files" hidden>
+          <div class="workspace-heading"><span>agent-workspace</span><span class="workspace-count" id="workspace-count"></span></div>
+          <div class="workspace-tree" id="workspace-tree" aria-label="Agent workspace files and folders">
+            <div class="workspace-message" id="workspace-message">Workspace appears when a run starts.</div>
+          </div>
+        </section>
+      </aside>
+    </section>
+
+  </main>
+
+  <script>
+    (() => {
+      const $ = (id) => document.getElementById(id);
+      const state = { status: null, runId: null, events: new Map(), liveMessage: null, before: null, hasMore: false, loading: false, initial: false, exportReady: false, refreshing: false, eventsRefreshing: false, liveRefreshing: false, workspaceData: null, workspaceFocus: null, workspaceOpenPaths: new Set(), workspaceFetchedAt: 0, workspaceRefreshing: false, workspaceUnavailable: false, workspaceInitialized: false, workspaceRenderedRunId: null, workspaceTreeSignature: '' };
+      const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+      const eventName = (event) => ({
+        model_context: 'Model context', model_message: 'Assistant reply', tool_call_started: 'Tool call', tool_call_finished: 'Tool result',
+        agent_turn_started: 'Agent turn', agent_error: 'Agent error', run_stopped: 'Run stopped', agent_run_finished: 'Agent finished',
+        viewer_frame: 'Frame captured', bot_connected: 'Bot connected', run_created: 'Run created', agent_started: 'Agent started',
+        model_probe_request: 'Model check', model_probe_passed: 'Model ready', run_failed: 'Run failed',
+      }[event.type] || event.type.replaceAll('_', ' '));
+      const when = (value) => { try { return new Date(value).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }); } catch { return ''; } };
+
+      async function api(path, options = {}) {
+        const response = await fetch(path, { cache: 'no-store', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+        const type = response.headers.get('content-type') || '';
+        const value = type.includes('application/json') ? await response.json() : await response.text();
+        if (!response.ok) throw new Error(value?.error || `Request failed (${response.status})`);
+        return value;
+      }
+
+      function showError(message = '') {
+        $('error').textContent = message;
+        $('error').style.display = message ? 'block' : 'none';
+      }
+
+      function setTheme(theme, save = false) {
+        const chosen = theme === 'dark' ? 'dark' : 'light';
+        document.documentElement.dataset.theme = chosen;
+        document.documentElement.dataset.webtuiTheme = chosen;
+        $('theme-label').textContent = chosen === 'dark' ? 'Dark' : 'Light';
+        $('theme-toggle').setAttribute('aria-label', `Switch to ${chosen === 'dark' ? 'light' : 'dark'} theme`);
+        if (save) {
+          try { localStorage.setItem('minecraft-agent-theme', chosen); } catch { /* Theme still applies for this page. */ }
+        }
+      }
+
+      function updateMission(run = null) {
+        const fallback = {
+          diamond_pilot: 'have at least one diamond in your inventory.',
+          dragon_proof: 'defeat the Ender Dragon.',
+        }[$('task').value] || 'complete the selected goal.';
+        const mission = String(run?.objective || fallback).trim();
+        $('objective').textContent = mission ? `Your task is to ${mission[0].toLowerCase()}${mission.slice(1)}` : '';
+      }
+
+      function setContextView(view) {
+        const showWorkspace = view === 'workspace';
+        $('conversation-tab').setAttribute('aria-selected', String(!showWorkspace));
+        $('workspace-tab').setAttribute('aria-selected', String(showWorkspace));
+        $('trace-panel').hidden = showWorkspace;
+        $('workspace-panel').hidden = !showWorkspace;
+      }
+
+      async function control(method, params = {}) {
+        showError();
+        try {
+          const result = await api('/api/control', { method: 'POST', body: JSON.stringify({ method, params }) });
+          if (result?.path && method === 'export_run') {
+            state.exportReady = true;
+            $('download').href = `/api/artifact?run_id=${encodeURIComponent(state.runId)}`;
+          }
+          await refresh();
+          return result;
+        } catch (error) {
+          showError(error.message);
+          return null;
+        }
+      }
+
+      function clean(value) {
+        if (Array.isArray(value)) return value.map(clean).filter((item) => item !== null);
+        if (value && typeof value === 'object') {
+          if (['thinking', 'reasoning'].includes(value.type)) return null;
+          return Object.fromEntries(Object.entries(value)
+            .filter(([key, item]) => !['thinking', 'exposed_reasoning'].includes(key) && !(key === 'reasoning' && typeof item === 'string'))
+            .map(([key, item]) => [key, clean(item)]));
+        }
+        return value;
+      }
+
+      function addEvents(items) {
+        let changed = false;
+        for (const source of items || []) {
+          if (['reasoning_update', 'tool_call'].includes(source.type)) continue;
+          const event = clean(source);
+          if (Number.isInteger(event.sequence)) {
+            const current = state.events.get(event.sequence);
+            const merged = current
+              ? { ...current, ...event, payload: { ...(current.payload || {}), ...(event.payload || {}) } }
+              : event;
+            if (!current || JSON.stringify(current) !== JSON.stringify(merged)) {
+              state.events.set(event.sequence, merged);
+              changed = true;
+            }
+          }
+        }
+        if (changed) {
+          renderTimeline();
+          if (state.status) renderStatus();
+        }
+        return changed;
+      }
+
+      async function loadPage(before = null, prepend = false) {
+        if (!state.runId || state.loading || (!state.hasMore && before !== null)) return;
+        state.loading = true;
+        const list = $('timeline');
+        const oldHeight = list.scrollHeight;
+        const oldTop = list.scrollTop;
+        try {
+          const query = new URLSearchParams({ run_id: state.runId, limit: '25' });
+          if (before !== null) query.set('before', String(before));
+          const page = await api(`/api/events?${query}`);
+          state.before = page.next_before;
+          state.hasMore = Boolean(page.has_more);
+          addEvents(page.events);
+          if (prepend) list.scrollTop = oldTop + (list.scrollHeight - oldHeight);
+          else if (!state.initial) { list.scrollTop = list.scrollHeight; state.initial = true; }
+        } catch (error) {
+          showError(error.message);
+        } finally {
+          state.loading = false;
+        }
+      }
+
+      async function refreshRecentEvents() {
+        if (!state.runId || state.eventsRefreshing) return;
+        state.eventsRefreshing = true;
+        try {
+          const query = new URLSearchParams({ run_id: state.runId, limit: '25' });
+          const page = await api(`/api/events?${query}`);
+          addEvents(page.events);
+        } catch { /* The status poll reports app availability. */ }
+        finally { state.eventsRefreshing = false; }
+      }
+
+      function jsonText(value) {
+        try { return JSON.stringify(value, null, 2); } catch { return String(value ?? ''); }
+      }
+
+      const isNumber = (value) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+
+      function transcriptHtml(messages) {
+        return (messages || []).map((message) => {
+          const pieces = (message.content || []).map((content) => {
+            if (content.type === 'tool_call') return `$ ${content.name}\n${jsonText(content.arguments || {})}`;
+            if (content.type === 'image') return `[image: ${content.label || 'captured for this request'}]`;
+            return content.text || '';
+          }).filter(Boolean);
+          return `<div class="trace-message"><span class="trace-role">${esc(message.role)}</span><pre size-="small" class="trace-text">${esc(pieces.join('\n'))}</pre></div>`;
+        }).join('');
+      }
+
+      function frameHtml(path) {
+        if (!path) return '';
+        const src = `/api/frame?run_id=${encodeURIComponent(state.runId)}&path=${encodeURIComponent(path)}`;
+        return `<img class="trace-image" alt="Frame captured for the model" loading="lazy" src="${esc(src)}">`;
+      }
+
+      function toolOutput(payload) {
+        if (!payload.result) return '(no output)';
+        let result = payload.result;
+        if (typeof result === 'string') {
+          try { result = JSON.parse(result); } catch { return result; }
+        }
+        const details = result?.details;
+        if (payload.tool === 'bash' && details && typeof details === 'object') {
+          const stdout = String(details.stdout || '').trimEnd();
+          const stderr = String(details.stderr || '').trimEnd();
+          const output = [stdout, stderr && `stderr:\n${stderr}`].filter(Boolean).join('\n');
+          const status = `exit code ${details.exit_code ?? '?'} · ${details.status || 'finished'}`;
+          return `${output || '(no stdout or stderr)'}\n${status}`;
+        }
+        if (details && typeof details === 'object') return jsonText(details).slice(0, 6000);
+        const text = (result?.content || []).filter((item) => item?.type === 'text').map((item) => item.text || '').join('\n');
+        if (text) {
+          try { return jsonText(JSON.parse(text)).slice(0, 6000); } catch { return text.slice(0, 6000); }
+        }
+        return (typeof result === 'string' ? result : jsonText(result)).slice(0, 6000);
+      }
+
+      function renderToolCall(start, finish) {
+        const call = start?.payload || finish?.payload || {};
+        const result = finish?.payload || {};
+        const args = call.arguments && Object.keys(call.arguments).length ? ` ${jsonText(call.arguments)}` : '';
+        const command = call.tool === 'bash' && call.arguments?.command ? call.arguments.command : `${call.tool || 'tool'}${args}`;
+        const elapsed = isNumber(result.duration_ms) ? `Took ${Number(result.duration_ms).toLocaleString()} ms` : finish ? 'Finished' : 'Running';
+        const status = finish?.payload?.is_error ? 'Failed' : elapsed;
+        return `<article class="trace-event trace-tool"><div class="trace-command"><span class="prompt">$</span> ${esc(command)}</div>`
+          + `<pre is-="pre" size-="small" class="trace-output ${result.is_error ? 'error-text' : ''}">${esc(finish ? toolOutput(result) : 'Running…')}</pre>`
+          + `<div class="trace-meta"><span>${esc(status)}</span><span>#${start?.sequence || finish?.sequence || ''} · ${esc(when(start?.wall_time || finish?.wall_time))}</span></div></article>`;
+      }
+
+      function renderEvent(event) {
+        const payload = event.payload || {};
+        if (event.type === 'tool_call_started') return renderToolCall(event, null);
+        if (event.type === 'tool_call_finished') return renderToolCall(null, event);
+        const tone = event.type === 'model_context' ? 'context'
+          : event.type === 'model_message' ? 'message'
+            : event.type === 'agent_error' || event.type === 'run_failed' || payload.is_error ? 'failure' : '';
+        const meta = `<div class="trace-meta"><span class="trace-kind">${esc(eventName(event))}</span><span class="trace-time">#${event.sequence} · ${esc(when(event.wall_time))}</span></div>`;
+        let body = '';
+
+        if (event.type === 'model_context') {
+          const sections = payload.segments || [];
+          const messages = payload.transcript || [];
+          const providerTokens = payload.provider_input_tokens;
+          const tokenCount = Number(providerTokens ?? payload.estimated_input_tokens ?? 0).toLocaleString();
+          const countKind = providerTokens == null ? 'estimated' : 'reported';
+          body = `<p class="trace-text">Request ${esc(payload.request_id || '')} · ${esc(payload.model || 'model')} · ${tokenCount} ${countKind} input tokens</p>`
+            + `${frameHtml(payload.current_frame?.path)}`
+            + `<details class="trace-details"><summary>Context sent · ${sections.length} sections · ${tokenCount} tokens</summary>${sections.map((section) => `<div class="trace-segment"><strong>${esc(section.label || section.key)} · ${Number(section.estimated_tokens || 0).toLocaleString()} tokens</strong><pre size-="small">${esc(section.preview || '(no preview)')}</pre></div>`).join('')}</details>`
+            + (messages.length ? `<details class="trace-details"><summary>Conversation sent · ${messages.length} messages</summary>${transcriptHtml(messages)}</details>` : '');
+        } else if (event.type === 'model_message') {
+          const calls = payload.tool_calls || [];
+          const usage = payload.usage || {};
+          const timing = payload.timing || {};
+          const metrics = [
+            usage.input_tokens != null && `in ${Number(usage.input_tokens).toLocaleString()}`,
+            usage.output_tokens != null && `out ${Number(usage.output_tokens).toLocaleString()}`,
+            usage.reasoning_tokens != null && `private reasoning ${Number(usage.reasoning_tokens).toLocaleString()}`,
+            timing.ttft_ms != null && `first text ${Number(timing.ttft_ms).toLocaleString()} ms`,
+            timing.output_tokens_per_second != null && `${Number(timing.output_tokens_per_second).toLocaleString()} tok/s`,
+          ].filter(Boolean);
+          body = payload.text ? (calls.length
+            ? `<div class="trace-plan">${esc(payload.text)}</div>`
+            : `<p class="trace-text">${esc(payload.text)}</p>`)
+            : (calls.length ? `<p class="trace-text">Called ${esc(calls.map((call) => call.name).join(', '))}</p>` : '');
+          if (metrics.length) body += `<div class="trace-metrics">${metrics.map(esc).join(' · ')}</div>`;
+        } else if (event.type === 'agent_turn_started') {
+          body = `<p class="trace-text">${esc(payload.model || 'Agent')} received a new world observation.</p>`;
+        } else if (event.type === 'viewer_frame') {
+          body = `<p class="trace-text">World frame captured for the next model request.</p>${frameHtml(payload.path)}`;
+        } else {
+          const summary = payload.message || payload.error || payload.status || payload.title || '';
+          body = summary ? `<p class="trace-text">${esc(summary)}</p>` : '';
+          if (Object.keys(payload).length) body += `<details class="trace-details"><summary>Details</summary><pre size-="small" class="trace-output">${esc(jsonText(payload))}</pre></details>`;
+        }
+
+        return `<article class="trace-event ${tone}">${event.type === 'model_message' ? '' : meta}${body}</article>`;
+      }
+
+      function renderTimeline() {
+        const list = $('timeline');
+        const oldTop = list.scrollTop;
+        const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 48;
+        const events = [...state.events.values()].sort((a, b) => a.sequence - b.sequence);
+        const more = state.hasMore ? '<button id="more" class="load-more">Load older activity</button>' : '';
+        const finishes = new Map(events.filter((event) => event.type === 'tool_call_finished' && event.payload?.tool_call_id).map((event) => [event.payload.tool_call_id, event]));
+        const starts = new Set(events.filter((event) => event.type === 'tool_call_started' && event.payload?.tool_call_id).map((event) => event.payload.tool_call_id));
+        const rendered = events.map((event) => {
+          const id = event.payload?.tool_call_id;
+          if (event.type === 'tool_call_finished' && starts.has(id)) return '';
+          return event.type === 'tool_call_started' ? renderToolCall(event, finishes.get(id)) : renderEvent(event);
+        }).join('');
+        const live = state.liveMessage ? `<article class="trace-event trace-live"><div class="trace-meta"><span class="trace-kind">${esc(state.liveMessage.model || 'Model')} · live response</span><span>Streaming</span></div><p class="trace-text">${esc(state.liveMessage.text || 'Thinking…')}<span class="stream-cursor">▍</span></p></article>` : '';
+        list.innerHTML = more + (events.length || live ? rendered + live : '<div class="trace-empty">No conversation or actions yet.</div>');
+        const moreButton = $('more');
+        if (moreButton) moreButton.addEventListener('click', () => loadPage(state.before, true));
+        if (nearBottom) list.scrollTop = list.scrollHeight;
+        else list.scrollTop = oldTop;
+        $('trace-count').textContent = events.length ? `${events.length} ${events.length === 1 ? 'event' : 'events'}` : '';
+      }
+
+      function allRecentEvents(run) {
+        const events = new Map();
+        for (const event of [...(run?.recent_events || []), ...state.events.values()]) {
+          const key = Number.isInteger(event.sequence) ? event.sequence : `${event.type}-${event.payload?.tool_call_id || ''}`;
+          events.set(key, event);
+        }
+        return [...events.values()].sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+      }
+
+      function pendingTool(events) {
+        const finished = new Set(events.filter((event) => event.type === 'tool_call_finished').map((event) => event.payload?.tool_call_id));
+        return [...events].reverse().find((event) => event.type === 'tool_call_started' && !finished.has(event.payload?.tool_call_id)) || null;
+      }
+
+      function workspacePath(value) {
+        if (typeof value !== 'string') return null;
+        const path = value.trim().replaceAll('\\', '/').replace(/^\.\//, '');
+        if (!path || path.startsWith('/') || /^[a-z]:/i.test(path)) return null;
+        const parts = path.split('/').filter((part) => part && part !== '.');
+        if (!parts.length || parts.some((part) => part === '..')) return null;
+        return parts.join('/');
+      }
+
+      function workspaceFocusFromEvents(events) {
+        let focus = null;
+        for (const event of events) {
+          const payload = event.payload || {};
+          if (event.type === 'workspace_revision') {
+            const files = payload.files || [];
+            for (const file of files) focus = workspacePath(file?.path) || focus;
+          } else if (event.type === 'workspace_tool') {
+            focus = workspacePath(payload.arguments?.path || payload.result?.path) || focus;
+          } else if (event.type === 'tool_call_started') {
+            const args = payload.arguments || {};
+            let path = args.path || args.file;
+            if (!path && payload.tool === 'bash' && typeof args.command === 'string') {
+              path = args.command.match(/\bmc-run\s+['"]?([^\s'";&|]+)/)?.[1]
+                || args.command.match(/\b(?:node|python3?|cat|less|head|tail)\s+['"]?([^\s'";&|]+\.(?:js|mjs|py|sh|json|md|txt))/)?.[1];
+            }
+            focus = workspacePath(path) || focus;
+          }
+        }
+        return focus;
+      }
+
+      function countWorkspaceNodes(nodes) {
+        return (nodes || []).reduce((count, node) => count + 1 + countWorkspaceNodes(node.children), 0);
+      }
+
+      function treeWithFocusedPath(nodes, path) {
+        if (!path) return nodes;
+        const parts = path.split('/');
+        if (parts.some((part) => ['.runtime', '.history', '.git', 'node_modules'].includes(part))) return nodes;
+        function insert(level, index, parentPath) {
+          const name = parts[index];
+          const currentPath = parentPath ? `${parentPath}/${name}` : name;
+          const existing = level.find((node) => node.name === name);
+          if (existing) {
+            if (index === parts.length - 1 || existing.kind !== 'directory') return level;
+            return level.map((node) => node === existing ? { ...node, children: insert(node.children || [], index + 1, currentPath) } : node);
+          }
+          const folder = index < parts.length - 1;
+          const node = { name, path: currentPath, kind: folder ? 'directory' : 'file', children: folder ? insert([], index + 1, currentPath) : undefined };
+          return [...level, node].sort((a, b) => (a.kind !== 'directory') - (b.kind !== 'directory') || a.name.localeCompare(b.name));
+        }
+        return insert(nodes, 0, '');
+      }
+
+      function workspaceNodeHtml(node) {
+        const path = esc(node.path);
+        if (node.kind === 'directory') {
+          const open = state.workspaceOpenPaths.has(node.path) ? ' open' : '';
+          const active = state.workspaceFocus === node.path;
+          return `<details data-workspace-folder="${path}" data-active="${active}"${open}><summary>${esc(node.name)}/</summary><div class="workspace-children">${(node.children || []).map(workspaceNodeHtml).join('')}</div></details>`;
+        }
+        const active = state.workspaceFocus === node.path;
+        const glyph = node.kind === 'file' ? '·' : node.kind === 'link' ? '↗' : '›';
+        return `<div class="workspace-file" data-workspace-path="${path}" data-active="${active}"${active ? ' aria-current="true"' : ''}><span class="workspace-file-glyph">${glyph}</span><span>${esc(node.name)}</span></div>`;
+      }
+
+      function captureWorkspaceOpenPaths() {
+        if (state.workspaceRenderedRunId !== state.runId) return;
+        for (const folder of $('workspace-tree').querySelectorAll('details[data-workspace-folder]')) {
+          if (folder.open) state.workspaceOpenPaths.add(folder.dataset.workspaceFolder);
+          else state.workspaceOpenPaths.delete(folder.dataset.workspaceFolder);
+        }
+      }
+
+      function renderWorkspaceTree(focusChanged = false) {
+        const sourceTree = state.workspaceData?.tree || [];
+        const tree = treeWithFocusedPath(sourceTree, state.workspaceFocus);
+        const treeElement = $('workspace-tree');
+        const currentRun = state.runId;
+        captureWorkspaceOpenPaths();
+        if (state.workspaceRenderedRunId !== currentRun) {
+          state.workspaceOpenPaths.clear();
+          state.workspaceInitialized = false;
+        }
+        if (focusChanged && state.workspaceFocus) {
+          const parts = state.workspaceFocus.split('/');
+          for (let index = 1; index < parts.length; index++) state.workspaceOpenPaths.add(parts.slice(0, index).join('/'));
+        }
+        if (state.workspaceUnavailable) {
+          $('workspace-count').textContent = '';
+          treeElement.innerHTML = '<div class="workspace-message">Workspace list will load after the daemon reloads.</div>';
+        } else if (!currentRun) {
+          $('workspace-count').textContent = '';
+          treeElement.innerHTML = '<div class="workspace-message">No run workspace.</div>';
+        } else if (!state.workspaceData) {
+          $('workspace-count').textContent = '';
+          treeElement.innerHTML = '<div class="workspace-message">Loading files…</div>';
+        } else if (!tree.length) {
+          $('workspace-count').textContent = '0 items';
+          treeElement.innerHTML = '<div class="workspace-message">No files yet.</div>';
+        } else {
+          if (!state.workspaceInitialized) {
+            for (const node of tree) if (node.kind === 'directory') state.workspaceOpenPaths.add(node.path);
+            state.workspaceInitialized = true;
+          }
+          $('workspace-count').textContent = `${countWorkspaceNodes(tree)}${state.workspaceData.truncated ? '+' : ''} items`;
+          treeElement.innerHTML = tree.map(workspaceNodeHtml).join('');
+        }
+        state.workspaceRenderedRunId = currentRun;
+        state.workspaceTreeSignature = JSON.stringify(sourceTree);
+      }
+
+      async function refreshWorkspace() {
+        if (!state.runId || Date.now() - state.workspaceFetchedAt < 4000 || state.workspaceRefreshing) return;
+        const requestRun = state.runId;
+        state.workspaceFetchedAt = Date.now();
+        state.workspaceRefreshing = true;
+        try {
+          const data = await api(`/api/workspace?run_id=${encodeURIComponent(requestRun)}`);
+          if (data.run_id !== state.runId || requestRun !== state.runId) return;
+          const wasUnavailable = state.workspaceUnavailable;
+          state.workspaceUnavailable = false;
+          state.workspaceData = data;
+          const nextFocus = workspaceFocusFromEvents(allRecentEvents(state.status?.active_run || state.status?.previous_run));
+          const focusChanged = nextFocus !== state.workspaceFocus;
+          state.workspaceFocus = nextFocus;
+          const signature = JSON.stringify(data.tree || []);
+          if (wasUnavailable || signature !== state.workspaceTreeSignature || focusChanged || state.workspaceRenderedRunId !== state.runId) renderWorkspaceTree(focusChanged);
+        } catch (error) {
+          if (requestRun === state.runId && /404|workspace is not available/i.test(error.message)) {
+            if (!state.workspaceUnavailable) {
+              state.workspaceUnavailable = true;
+              renderWorkspaceTree();
+            }
+          }
+        } finally {
+          state.workspaceRefreshing = false;
+        }
+      }
+
+      $('workspace-tree').addEventListener('click', (event) => {
+        const summary = event.target.closest('summary');
+        if (!summary) return;
+        const details = summary.parentElement;
+        const path = details?.dataset.workspaceFolder;
+        if (!path) return;
+        // The native details toggle updates after click; save the desired state on the next task.
+        setTimeout(() => {
+          if (details.open) state.workspaceOpenPaths.add(path);
+          else state.workspaceOpenPaths.delete(path);
+        }, 0);
+      });
+
+      function setAgent(mode, label) {
+        const card = $('agent-card');
+        const image = $('steve');
+        const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const imageMode = reducedMotion && mode === 'walking' ? 'idle' : mode;
+        const source = {
+          thinking: 'https://skinrender.dev/render/steve/body?size=384&pose=think',
+          walking: 'https://skinrender.dev/render/steve/body?pose=walk&format=apng',
+          acting: 'https://skinrender.dev/render/steve/body?size=384',
+          idle: 'https://skinrender.dev/render/steve/body?size=384',
+        }[imageMode] || 'https://skinrender.dev/render/steve/body?size=384';
+        card.dataset.mode = reducedMotion && mode === 'walking' ? 'acting' : mode;
+        $('activity-line').hidden = mode === 'idle';
+        if (image.dataset.source !== source) { image.src = source; image.dataset.source = source; }
+        image.alt = `Steve ${imageMode === 'thinking' ? 'thinking' : imageMode === 'walking' ? 'walking' : 'standing'}`;
+        $('activity').textContent = label;
+      }
+
+      function playerSnapshot(events) {
+        let player = null;
+        const observedHealth = (value, depth = 0) => {
+          if (depth > 4 || value == null) return null;
+          if (typeof value === 'string') {
+            try { return observedHealth(JSON.parse(value), depth + 1); }
+            catch {
+              const playerStart = value.search(/\\?"player\\?"\s*:\s*\{/);
+              if (playerStart < 0) return null;
+              const health = value.slice(playerStart).match(/\\?"health\\?"\s*:\s*(-?\d+(?:\.\d+)?)/);
+              return health ? Number(health[1]) : null;
+            }
+          }
+          if (Array.isArray(value)) {
+            for (const item of value) {
+              const health = observedHealth(item, depth + 1);
+              if (health !== null) return health;
+            }
+            return null;
+          }
+          if (typeof value !== 'object') return null;
+          const player = value.player || value.observation?.player;
+          if (player && isNumber(player.health)) return Number(player.health);
+          return observedHealth([value.player_health, value.details, ...(value.content || []).map((item) => item?.text)], depth + 1);
+        };
+        for (const event of events) {
+          const payload = event.payload || {};
+          if (event.type === 'bot_connected' && isNumber(payload.health)) {
+            player = { health: Number(payload.health) };
+          }
+          if (event.type !== 'tool_call_finished' || payload.tool !== 'minecraft_observe') continue;
+          try {
+            const health = observedHealth(payload.player_health ?? payload.result);
+            if (health !== null && Number.isFinite(health)) player = { health };
+          } catch { /* Older tool results may be plain text. */ }
+        }
+        return player;
+      }
+
+      function renderHealth(events) {
+        const player = playerSnapshot(events);
+        const health = player ? Math.max(0, Math.min(20, Number(player.health))) : null;
+        const hearts = $('hearts');
+        hearts.innerHTML = Array.from({ length: 10 }, (_, index) => {
+          const value = health === null ? 0 : health / 2 - index;
+          const asset = value >= 1 ? 'full.png' : value > 0 ? 'half.png' : 'container.png';
+          return `<img class="heart" alt="" src="https://raw.githubusercontent.com/PrismarineJS/minecraft-assets/master/data/1.21.4/gui/sprites/hud/heart/${asset}">`;
+        }).join('');
+        $('health-value').textContent = health === null ? '— / 20' : `${health} / 20`;
+        $('hearts').setAttribute('aria-label', health === null ? 'Health not yet observed' : `${health} health points`);
+      }
+
+      function renderStatus() {
+        const status = state.status || {};
+        const run = status.active_run || status.previous_run || null;
+        const active = status.active_run;
+        const ready = status.service === 'ready';
+        if (active?.kind && [...$('task').options].some((option) => option.value === active.kind)) $('task').value = active.kind;
+        const auth = status.chatgpt_auth || {};
+        $('service').innerHTML = `<span class="dot ${ready ? 'ready' : ''}"></span><span>${ready ? 'Online' : 'Offline'}</span><span class="connection-summary">ChatGPT ${auth.connected ? 'connected' : 'not connected'}</span>`;
+        const states = { running: 'Running', probing_model: 'Starting', paused: 'Paused', passed: 'Complete', failed: 'Failed', stopped: 'Stopped', launching: 'Starting' };
+        $('run-state').textContent = run ? states[run.state] || 'Ready' : 'No run';
+        $('run-state').className = `run-state ${['running', 'probing_model', 'paused'].includes(run?.state) ? 'ready' : ''}`;
+
+        $('connect').textContent = auth.connected ? 'Disconnect' : 'Connect';
+        $('connect').onclick = () => control(auth.connected ? 'disconnect_chatgpt' : 'auth_start');
+        $('login-link').hidden = !auth.authorization_url;
+        if (auth.authorization_url) { $('login-link').href = auth.authorization_url; $('login-link').textContent = 'Continue sign-in'; }
+        $('callback').hidden = !auth.login_in_progress;
+        $('submit-callback').hidden = !auth.login_in_progress;
+        $('submit-callback').onclick = () => control('auth_callback', { url: $('callback').value });
+        updateMission(active || (run?.kind === $('task').value ? run : null));
+
+        const running = Boolean(active && ['running', 'probing_model', 'paused', 'launching'].includes(active.state));
+        $('start').disabled = running || !auth.connected;
+        $('pause').hidden = !active || active.state !== 'running';
+        $('pause').disabled = !active || active.state !== 'running';
+        $('resume').hidden = !active || active.state !== 'paused';
+        $('resume').disabled = !active || active.state !== 'paused';
+        $('stop').hidden = !running;
+        $('stop').disabled = !running;
+        $('export').hidden = !run || Boolean(active && ['launching', 'probing_model', 'running', 'paused'].includes(active.state));
+        $('export').disabled = !run || Boolean(active && ['launching', 'probing_model', 'running', 'paused'].includes(active.state));
+        $('download').hidden = !run?.run_id || !state.exportReady;
+        $('export').onclick = () => control('export_run');
+        $('start').onclick = () => control('start_run', { kind: $('task').value });
+        $('pause').onclick = () => control('pause_run');
+        $('resume').onclick = () => control('resume_run');
+        $('stop').onclick = () => control('stop_run');
+        const events = allRecentEvents(run);
+        const pending = pendingTool(events);
+        const tool = pending?.payload?.tool || '';
+        const toolArgs = jsonText(pending?.payload?.arguments || {});
+        const readonly = ['read', 'grep', 'find', 'ls', 'minecraft_observe', 'minecraft_verify_goal', 'web_search'].includes(tool);
+        const walking = pending && /\b(move|walk|navigate|pathfind)\b/i.test(`${tool} ${toolArgs}`);
+        let mode = 'idle', label = run?.state ? run.state.replaceAll('_', ' ') : 'Idle';
+        if (active?.state === 'paused') { mode = 'idle'; label = 'Paused'; }
+        else if (pending && walking) { mode = 'walking'; label = 'Walking'; }
+        else if (pending && readonly) { mode = 'thinking'; label = tool === 'minecraft_observe' ? 'Checking the world' : 'Inspecting'; }
+        else if (pending) { mode = 'acting'; label = `Acting · ${tool.replaceAll('_', ' ') || 'tool'}`; }
+        else if (['running', 'probing_model'].includes(active?.state)) { mode = 'thinking'; label = active.state === 'probing_model' ? 'Checking the model' : 'Thinking'; }
+        else if (active?.state === 'launching') { mode = 'idle'; label = 'Starting world'; }
+        else if (!run) { mode = 'idle'; label = 'Idle'; }
+        setAgent(mode, label);
+
+        const elapsed = Number(run?.active_elapsed_seconds || 0);
+        const activeTime = elapsed ? `${Math.floor(elapsed / 60)}m ${Math.floor(elapsed % 60)}s` : '—';
+        const runId = String(run?.run_id || '—');
+        const shortRunId = runId.length > 20 ? `${runId.slice(0, 17)}…` : runId;
+        $('facts').innerHTML = `<span title="${esc(runId)}">${esc(shortRunId)}</span><span>seed ${esc(run?.world_seed ?? '—')}</span><span>${esc(activeTime)}</span>`;
+        renderHealth(events);
+
+        const viewerUrl = ['running', 'paused', 'probing_model'].includes(active?.state) ? active.viewer_url : null;
+        if (viewerUrl && $('viewer').dataset.src !== viewerUrl) {
+          $('viewer').dataset.src = viewerUrl;
+          $('viewer').innerHTML = `<iframe title="Live Prismarine Viewer" src="${esc(viewerUrl)}" allow="fullscreen"></iframe>`;
+        } else if (!viewerUrl) {
+          delete $('viewer').dataset.src;
+          const message = active?.state === 'launching' ? 'Starting the Minecraft world…' : run ? 'Run finished. Its saved frames remain in the conversation trace.' : 'Start a run to open the live first-person world view.';
+          if ($('viewer').textContent !== message) $('viewer').innerHTML = `<div class="viewer-empty">${esc(message)}</div>`;
+        }
+
+        const candidates = auth.account_model_catalog?.candidates || [];
+        if (candidates.length && !$('model-picker')) {
+          const select = document.createElement('select');
+          select.id = 'model-picker';
+          select.setAttribute('aria-label', 'Model');
+          select.innerHTML = candidates.map((model) => `<option value="${esc(model.id)}">${esc(model.display_name || model.id)}</option>`).join('');
+          select.value = auth.account_model_catalog?.chosen?.id || '';
+          select.addEventListener('change', () => control('pin_default_model', { model_id: select.value }));
+          $('model-slot').replaceChildren(select);
+        } else if ($('model-picker')) {
+          $('model-picker').value = auth.account_model_catalog?.chosen?.id || '';
+        } else {
+          $('model-slot').innerHTML = '<span class="model-empty">—</span>';
+        }
+      }
+
+      async function refresh() {
+        if (state.refreshing) return;
+        state.refreshing = true;
+        try {
+          const status = await api('/api/status');
+          showError();
+          state.status = status;
+          renderStatus();
+          const nextRun = status.active_run?.run_id || status.previous_run?.run_id || null;
+          if (nextRun !== state.runId) {
+            state.runId = nextRun;
+            state.liveMessage = null;
+            state.events.clear();
+            state.before = null;
+            state.hasMore = Boolean(nextRun);
+            state.initial = false;
+            state.exportReady = false;
+            state.workspaceData = null;
+            state.workspaceFocus = null;
+            state.workspaceOpenPaths.clear();
+            state.workspaceFetchedAt = 0;
+            state.workspaceUnavailable = false;
+            state.workspaceInitialized = false;
+            state.workspaceRenderedRunId = null;
+            state.workspaceTreeSignature = '';
+            $('download').removeAttribute('href');
+            $('timeline').innerHTML = '<div class="trace-empty">Loading run trace…</div>';
+            renderWorkspaceTree();
+            if (nextRun) await loadPage();
+            else renderTimeline();
+          }
+          const run = status.active_run || status.previous_run;
+          if (run?.recent_events?.length) addEvents(run.recent_events);
+          await refreshRecentEvents();
+          await refreshWorkspace();
+        } catch (error) {
+          $('service').innerHTML = '<span class="dot"></span>Service unavailable';
+          showError(error.message);
+        } finally {
+          state.refreshing = false;
+        }
+      }
+
+      async function refreshLive() {
+        if (state.liveRefreshing) return;
+        if (!state.status?.active_run) {
+          if (state.liveMessage) { state.liveMessage = null; renderTimeline(); }
+          return;
+        }
+        state.liveRefreshing = true;
+        try {
+          const live = await api('/api/live');
+          if (live.run_id !== state.runId) return;
+          const next = live.message || null;
+          if (JSON.stringify(next) !== JSON.stringify(state.liveMessage)) {
+            state.liveMessage = next;
+            renderTimeline();
+          }
+        } catch { /* The regular status poll reports service errors. */ }
+        finally { state.liveRefreshing = false; }
+      }
+
+      $('timeline').addEventListener('scroll', (event) => {
+        if (event.target.scrollTop < 18 && state.hasMore && state.before !== null) loadPage(state.before, true);
+      });
+      setTheme(document.documentElement.dataset.theme || 'dark');
+      $('theme-toggle').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark', true));
+      $('task').addEventListener('change', () => updateMission(state.status?.active_run || null));
+      $('conversation-tab').addEventListener('click', () => setContextView('conversation'));
+      $('workspace-tab').addEventListener('click', () => setContextView('workspace'));
+      updateMission();
+      $('connect').onclick = () => control('auth_start');
+      $('start').onclick = () => control('start_run', { kind: $('task').value });
+      $('pause').onclick = () => control('pause_run');
+      $('resume').onclick = () => control('resume_run');
+      $('stop').onclick = () => control('stop_run');
+      $('export').onclick = () => control('export_run');
+      $('submit-callback').onclick = () => control('auth_callback', { url: $('callback').value });
+      refresh();
+      setInterval(refresh, 2000);
+      setInterval(refreshLive, 250);
+    })();
+  </script>
+</body>
+</html>

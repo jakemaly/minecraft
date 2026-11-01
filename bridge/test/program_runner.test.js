@@ -46,6 +46,25 @@ test('supports an exported async Mineflayer program with the live bot', async ()
   assert.equal(result.controls_released, true);
 });
 
+test('Node-style scripts can exit without terminating the live bridge', async () => {
+  const { runner } = fixture();
+  for (const source of [
+    'process.exit(0);',
+    'global.process.exit(0);',
+    "require('node:process').exit(0);",
+    "(async () => { await new Promise(resolve => setTimeout(resolve, 10)); process.exit(0); })().catch(() => process.exit(1));",
+  ]) {
+    const result = await runner.runProgram({ source });
+    assert.equal(result.status, 'completed');
+  }
+  const failedExit = await runner.runProgram({ source: 'process.exit(2);' });
+  assert.equal(failedExit.status, 'failed');
+  assert.equal(failedExit.error, 'program requested exit with code 2');
+  const afterExitAttempts = await runner.runProgram({ source: 'return 7;' });
+  assert.equal(afterExitAttempts.status, 'completed');
+  assert.equal(afterExitAttempts.result, 7);
+});
+
 test('stop cancels a running program promptly and releases controls', async () => {
   const { bot, runner } = fixture();
   const running = runner.runProgram({

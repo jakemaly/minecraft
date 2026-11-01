@@ -1,47 +1,35 @@
-"""Kernel-local objects for marimo; no process is reattached by PID alone."""
+"""Kernel-local state for the optional vLLM notebook."""
 
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any
 
 
-@dataclass
 class NotebookSession:
-    run_id: str | None = None
-    supervisor: Any = None
-    bridge: Any = None
-    planner: Any = None
-    selector: Any = None
-    agent_loop: Any = None
-    agent_thread: threading.Thread | None = None
-    events: Any = None
-    consumed_buttons: dict[str, int | float] = field(default_factory=dict)
-    reports: dict[str, Any] = field(default_factory=dict)
-    current_image_jpeg: bytes | None = None
-    current_image_meta: dict[str, Any] = field(default_factory=dict)
-    lock: threading.RLock = field(default_factory=threading.RLock)
+    def __init__(self):
+        self.vllm_supervisor = None
+        self.molab_runtime = None
+        self.reports: dict[str, dict] = {}
+        self._clicks: dict[str, float | int] = {}
+        self._lock = threading.Lock()
 
     def claim_button(self, name: str, value: int | bool | None) -> bool:
-        """Consume each run-button event once across reactive reruns."""
         if isinstance(value, bool):
             if not value:
                 return False
-            with self.lock:
+            with self._lock:
                 now = time.monotonic()
-                previous = float(self.consumed_buttons.get(name, 0))
-                if now - previous < 1.0:
+                if now - float(self._clicks.get(name, 0)) < 1:
                     return False
-                self.consumed_buttons[name] = now
+                self._clicks[name] = now
                 return True
-        counter = int(value or 0)
-        with self.lock:
-            previous = self.consumed_buttons.get(name, 0)
-            if counter <= previous:
+        with self._lock:
+            count = int(value or 0)
+            previous = int(self._clicks.get(name, 0))
+            if count <= previous:
                 return False
-            self.consumed_buttons[name] = counter
+            self._clicks[name] = count
             return True
 
 

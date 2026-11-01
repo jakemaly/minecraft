@@ -37,7 +37,11 @@ class BridgeClient:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError("Mineflayer bridge exited before ready")
+                self._stderr_thread.join(timeout=0.2)
+                stderr_tail = "".join(self._stderr_tail)[-1000:].strip()
+                self.stop()
+                detail = f": {stderr_tail}" if stderr_tail else ""
+                raise RuntimeError(f"Mineflayer bridge exited before ready{detail}")
             line = self._readline(min(0.5, max(0, deadline - time.monotonic())))
             if line:
                 event = json.loads(line)

@@ -38,6 +38,18 @@ class PiClient:
             "MINECRAFT_AGENT_REPO_ROOT": str(self.repo_root),
             "MINECRAFT_RUNTIME_HOME": str(self.runtime),
         }
+        for key in (
+            "MINECRAFT_LOCAL_MODEL_PROVIDER",
+            "MINECRAFT_LOCAL_MODEL_ID",
+            "MINECRAFT_LOCAL_MODEL_BASE_URL",
+            "MINECRAFT_LOCAL_MODEL_REVISION",
+            "MINECRAFT_LOCAL_MODEL_CONTEXT_WINDOW",
+            "MINECRAFT_LOCAL_MODEL_MAX_TOKENS",
+            "MINECRAFT_CHROME",
+        ):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
         self.process = subprocess.Popen(
             ["node", str(bridge / "src/pi_agent.mjs")],
             cwd=bridge,

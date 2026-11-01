@@ -1,4 +1,4 @@
-"""Persistent Linux service that owns Minecraft processes independently of Marimo."""
+"""Persistent service for the Minecraft app, agent, and world processes."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import signal
 import socket
 import socketserver
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -22,14 +23,44 @@ from pathlib import Path
 from typing import Any
 
 from .bridge_client import BridgeClient
+from .app_server import create_server as create_app_server
 from .containers import bot_container_command, cleanup_run_containers, connect_gateway_to_network, create_private_network, ensure_runtime_images, gateway_container_command, remove_private_network, server_container_command
 from .config import RunConfig, runtime_root
 from .events import EventLog
-from .identity import source_identity
 from .network import client_tailscale_address, tailscale_address, viewer_url
 from .pi_client import PiClient
 from .supervisor import RunState, Supervisor
 from .workspace import Workspace
+
+
+def _visible_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    if event.get("type") == "reasoning_update":
+        return None
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            if value.get("type") in {"thinking", "reasoning"}:
+                return None
+            return {
+                key: clean(item) for key, item in value.items()
+                if key not in {"thinking", "exposed_reasoning"}
+                and not (key == "reasoning" and isinstance(item, (str, dict, list)))
+            }
+        if isinstance(value, list):
+            return [cleaned for item in value if (cleaned := clean(item)) is not None]
+        return value
+
+    return clean(event)
+
+
+def _new_bridge_socket_path() -> tuple[Path, Path]:
+    """Create a private, short Unix socket path that fits Linux's sun_path limit."""
+    directory = Path(tempfile.mkdtemp(prefix="mc-", dir="/tmp"))
+    socket_path = directory / "bridge.sock"
+    if len(os.fsencode(socket_path)) >= 108:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise RuntimeError("temporary directory produced an overlong Mineflayer socket path")
+    return directory, socket_path
 
 
 @dataclass
@@ -51,11 +82,12 @@ class ActiveRun:
     supervisor: Supervisor
     model: dict[str, Any]
     bridge: BridgeClient | None = None
+    bridge_socket_directory: Path | None = None
     workspace: Workspace | None = None
     state: str = "launching"
     phase: str = "preflight"
     error: str | None = None
-    observer_username: str | None = None
+    live_message: dict[str, Any] | None = None
     docker_network: str | None = None
     containerized: bool = False
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -113,8 +145,11 @@ class RunDaemon:
         self.pi = PiClient(self.repo_root, self.runtime, self.socket_path, self._on_pi_event)
         self.pi.start()
         self._server: _ThreadedUnixServer | None = None
+        self._control_thread: threading.Thread | None = None
+        self._app_server = None
+        self._app_thread: threading.Thread | None = None
 
-    def serve(self) -> None:
+    def serve(self, *, include_dashboard: bool = True) -> None:
         if self.socket_path.exists():
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as check:
                 check.settimeout(0.2)
@@ -127,8 +162,16 @@ class RunDaemon:
         server.daemon = self
         os.chmod(self.socket_path, 0o600)
         self._server = server
+        self._control_thread = threading.Thread(target=server.serve_forever, name="minecraft-control", daemon=True)
+        self._control_thread.start()
+        if include_dashboard:
+            app_host = os.getenv("MINECRAFT_DASHBOARD_HOST", tailscale_address())
+            app_port = int(os.getenv("MINECRAFT_DASHBOARD_PORT", "2718"))
+            self._app_server = create_app_server(self, app_host, app_port)
+            self._app_thread = threading.Thread(target=self._app_server.serve_forever, name="minecraft-app", daemon=True)
+            self._app_thread.start()
         self._write_service_state()
-        server.serve_forever(poll_interval=0.25)
+        self._control_thread.join()
 
     def close(self) -> None:
         self.closing = True
@@ -144,6 +187,9 @@ class RunDaemon:
         if self._server:
             self._server.shutdown()
             self._server.server_close()
+        if self._app_server:
+            self._app_server.shutdown()
+            self._app_server.server_close()
         self.socket_path.unlink(missing_ok=True)
 
     def dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -172,8 +218,6 @@ class RunDaemon:
             return self.resume_run()
         if method == "stop_run":
             return self.stop_run()
-        if method == "set_observer":
-            return self.set_observer(str(params.get("username", "")))
         if method == "export_run":
             return self.export_run()
         if method == "workspace_tool":
@@ -191,7 +235,7 @@ class RunDaemon:
     def agent_bridge_request(self, params: dict[str, Any]) -> dict[str, Any]:
         run_id = str(params.get("run_id", ""))
         bridge_method = str(params.get("method", ""))
-        if bridge_method not in {"observe", "verify_goal", "viewer_snapshot", "release_controls"}:
+        if bridge_method not in {"observe", "verify_goal", "release_controls"}:
             raise ValueError("unsupported agent bridge request")
         with self.lock:
             run = self.active
@@ -282,10 +326,10 @@ class RunDaemon:
                     "run_directory": str(run.run_directory),
                     "server_address": f"{run.bind_address}:{run.server_port}",
                     "viewer_url": run.viewer_url,
-                    "observer_username": run.observer_username,
                     "containerized": run.containerized,
                     "docker_network": run.docker_network,
                     "supervisor": run.supervisor.status(),
+                    "live_message": dict(run.live_message) if run.live_message else None,
                     "recent_events": self._recent_events(run),
                     "export_path": str(self.runtime / "exports" / f"{run.run_id}.zip") if (self.runtime / "exports" / f"{run.run_id}.zip").exists() else None,
                 }
@@ -299,7 +343,7 @@ class RunDaemon:
             }
 
     @staticmethod
-    def _recent_events(run: ActiveRun, limit: int = 100) -> list[dict[str, Any]]:
+    def _recent_events(run: ActiveRun, limit: int = 40) -> list[dict[str, Any]]:
         path = run.run_directory / "events" / "events.jsonl"
         if not path.exists():
             return []
@@ -312,10 +356,112 @@ class RunDaemon:
                 file.readline()
             for line in file:
                 try:
-                    tail.append(json.loads(line))
+                    event = json.loads(line)
+                    visible = _visible_event(event) if isinstance(event, dict) else None
+                    if visible is not None:
+                        tail.append(visible)
                 except json.JSONDecodeError:
                     continue
-        return tail[-limit:]
+        visible = []
+        for event in tail[-limit:]:
+            payload = event.get("payload") or {}
+            if event.get("type") == "tool_call_started":
+                payload = {key: payload[key] for key in ("tool", "tool_call_id", "arguments") if key in payload}
+            elif event.get("type") == "tool_call_finished":
+                payload = {key: payload[key] for key in ("tool", "tool_call_id", "is_error", "duration_ms", "result", "player_health") if key in payload}
+                if isinstance(payload.get("result"), str):
+                    payload["result"] = payload["result"][:6000]
+            elif event.get("type") == "model_context":
+                keys = ("request_id", "model", "context_window", "estimated_input_tokens", "provider_input_tokens", "context_utilization_percent", "image_policy", "current_frame")
+                payload = {key: payload[key] for key in keys if key in payload}
+                payload["segments"] = [
+                    {key: section[key] for key in ("key", "label", "kind", "estimated_tokens", "preview") if key in section}
+                    for section in (event.get("payload", {}).get("segments") or [])
+                ]
+                for section in payload["segments"]:
+                    if isinstance(section.get("preview"), str):
+                        section["preview"] = section["preview"][:300]
+                messages = event.get("payload", {}).get("transcript") or []
+                payload["transcript"] = messages[-6:]
+                while payload["transcript"] and len(json.dumps(payload["transcript"], ensure_ascii=False)) > 6000:
+                    payload["transcript"].pop(0)
+            elif event.get("type") == "model_message":
+                keys = ("request_id", "model", "text", "tool_calls", "usage", "timing", "error", "estimated_input_tokens", "context_window", "context_utilization_percent", "reasoning_visibility")
+                payload = {key: payload[key] for key in keys if key in payload}
+                if isinstance(payload.get("text"), str):
+                    payload["text"] = payload["text"][:6000]
+            elif event.get("type") in {"agent_error", "run_failed", "run_stopped", "agent_run_finished", "model_probe_passed"}:
+                keys = ("message", "error", "status", "turns", "active_elapsed_seconds", "model")
+                payload = {key: payload[key] for key in keys if key in payload}
+            elif event.get("type") == "bot_connected":
+                keys = ("username", "minecraft_version", "health", "food")
+                payload = {key: payload[key] for key in keys if key in payload}
+            else:
+                payload = {}
+            visible.append({**event, "payload": payload})
+        return visible
+
+    def live_status(self) -> dict[str, Any]:
+        with self.lock:
+            run = self.active
+            return {
+                "run_id": run.run_id if run else None,
+                "message": dict(run.live_message) if run and run.live_message else None,
+            }
+
+    def events_page(self, run_id: str, *, before: int | None = None, limit: int = 100) -> dict[str, Any]:
+        if not run_id or not all(char.isalnum() or char == "-" for char in run_id) or not run_id.startswith("run-"):
+            raise ValueError("invalid run ID")
+        if before is not None and before < 1:
+            raise ValueError("before must be a positive event sequence")
+        limit = min(25, max(1, limit))
+        run_root = (self.runtime / "runs" / run_id).resolve()
+        runs_root = (self.runtime / "runs").resolve()
+        if run_root.parent != runs_root or run_root.name != run_id:
+            raise ValueError("invalid run directory")
+        path = run_root / "events" / "events.jsonl"
+        if not path.is_file():
+            return {"events": [], "has_more": False, "next_before": None}
+
+        descending: list[dict[str, Any]] = []
+        chunk_size = 64 * 1024
+        remainder = b""
+        with path.open("rb") as file:
+            offset = file.seek(0, os.SEEK_END)
+            while offset > 0 and len(descending) <= limit:
+                start = max(0, offset - chunk_size)
+                file.seek(start)
+                data = file.read(offset - start) + remainder
+                lines = data.split(b"\n")
+                remainder = lines[0]
+                offset = start
+                candidates = lines[1:]
+                if offset == 0:
+                    candidates.insert(0, remainder)
+                    remainder = b""
+                for line in reversed(candidates):
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(event, dict) or not isinstance(event.get("sequence"), int):
+                        continue
+                    sequence = int(event.get("sequence", 0))
+                    if before is None or sequence < before:
+                        visible = _visible_event(event)
+                        if visible is not None:
+                            descending.append(visible)
+                            if len(descending) > limit:
+                                break
+        has_more = len(descending) > limit or offset > 0
+        events = list(reversed(descending[:limit]))
+        return {
+            "events": events,
+            "has_more": has_more,
+            "next_before": events[0]["sequence"] if events else None,
+        }
 
     def start_run(self, kind: str) -> dict[str, Any]:
         if kind not in {"diamond_pilot", "dragon_proof"}:
@@ -324,7 +470,9 @@ class RunDaemon:
         selection = auth.get("account_model_catalog") or {}
         model = selection.get("chosen")
         if not auth.get("connected") or not model:
-            raise RuntimeError("Connect with ChatGPT and verify an account model before starting a run.")
+            raise RuntimeError("Start the configured inference provider and verify its multimodal model before starting a run.")
+        if os.getenv("MINECRAFT_MOLAB_MODE") == "1" and model.get("provider") != "molab-vllm":
+            raise RuntimeError("Molab runs are restricted to the local vLLM provider; remote model fallback is disabled.")
         with self.lock:
             if self.active and self.active.state in self.ACTIVE_STATES:
                 raise RuntimeError(f"run {self.active.run_id} is already {self.active.state}")
@@ -336,7 +484,7 @@ class RunDaemon:
                 objective=("Have at least one diamond in the agent's inventory. This is the only success criterion. You may use any available tools to accomplish this." if kind == "diamond_pilot" else "Beat the Ender Dragon. The only success criterion is that the server records the minecraft:end/kill_dragon advancement. You may use any available tools to accomplish this."),
                 duration_hours=4 if kind == "diamond_pilot" else float(os.getenv("MINECRAFT_DRAGON_RUN_HOURS", "72")),
                 run_directory=self.runtime / "runs" / "launching", server_directory=self.runtime / "worlds" / "launching" / "server",
-                seed=0, bind_address=tailscale_address(), server_port=int(os.getenv("MINECRAFT_SERVER_PORT", "25565")),
+                seed=0, bind_address="127.0.0.1" if os.getenv("MINECRAFT_MOLAB_MODE") == "1" else tailscale_address(), server_port=int(os.getenv("MINECRAFT_SERVER_PORT", "25565")),
                 viewer_port=int(os.getenv("MINECRAFT_VIEWER_PORT", "3000")), viewer_url=None,
                 events=EventLog(self.runtime / "launching-events.jsonl", "launching", "launching"),
                 supervisor=Supervisor(self.runtime / "launching-supervisor", "launching"), model=model, state="launching", phase="preflight",
@@ -352,14 +500,18 @@ class RunDaemon:
         try:
             config = RunConfig.from_environment()
             config.validate()
-            container_status = ensure_runtime_images()
+            container_status = (
+                {"available": False, "reason": "Molab runs the harness directly inside the notebook host"}
+                if os.getenv("MINECRAFT_MOLAB_MODE") == "1"
+                else ensure_runtime_images()
+            )
             run_id = "run-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
             world_id = "world-" + uuid.uuid4().hex[:12]
             run_dir = self.runtime / "runs" / run_id
             server_dir = self.runtime / "worlds" / run_id / "server"
             run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
             server_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-            bind = tailscale_address()
+            bind = "127.0.0.1" if os.getenv("MINECRAFT_MOLAB_MODE") == "1" else tailscale_address()
             if bind != "127.0.0.1" and ipaddress.ip_address(bind).version != 4:
                 raise RuntimeError("Minecraft server and desktop clients currently require a Tailscale IPv4 address")
             server_port = int(os.getenv("MINECRAFT_SERVER_PORT", "25565"))
@@ -389,11 +541,11 @@ class RunDaemon:
                 "created_at": run.created_at, "kind": kind, "goal": goal,
                 "objective": objective, "max_active_hours": run.duration_hours,
                 "model": selected_model,
-                "model_provider": "OpenAI Sign in with ChatGPT OAuth through Pi",
-                "billing_policy": "ChatGPT subscription only; API-key fallback disabled",
+                "model_provider": "Molab-local vLLM through Pi" if selected_model.get("provider") == "molab-vllm" else "OpenAI Sign in with ChatGPT OAuth through Pi",
+                "billing_policy": "local notebook inference; remote provider fallback disabled" if selected_model.get("provider") == "molab-vllm" else "ChatGPT subscription only; API-key fallback disabled",
                 "game": {"minecraft_version": config.minecraft_version, "difficulty": "normal", "world_default_gamemode": "spectator", "agent_gamemode": "survival", "world_seed": seed, "server_bind": bind, "server_port": server_port, "online_mode": False, "server_jar_sha1": None},
-                "viewer": {"url": run.viewer_url, "bind_address": bind, "port": viewer_port, "renderer": "Prismarine Viewer 1.33.0", "first_person": True, "browser_capture": "384x216 PNG; one current image per model turn; previous image pixels omitted"},
-                "dependencies": source_identity(self.repo_root),
+                "viewer": {"url": run.viewer_url, "bind_address": bind, "port": viewer_port, "renderer": "Prismarine Viewer 1.33.0", "first_person": True, "browser_capture": "384x216 terrain-validated PNG; refreshed after each Mineflayer action; prior image pixels replaced"},
+                "dependencies": {"bridge_lock": "bridge/package-lock.json"},
                 "runtime": {
                     "containers": container_status,
                     "containerized": run.containerized,
@@ -402,6 +554,10 @@ class RunDaemon:
                 },
                 "limits": {"model_context_window": selected_model.get("context_window"), "model_output_limit": selected_model.get("max_output_tokens"), "artificial_context_cap": None},
             }
+            if selected_model.get("provider") == "molab-vllm":
+                from .model_runtime import inference_config
+                run.manifest["model_revision"] = selected_model.get("revision")
+                run.manifest["inference_config"] = inference_config()
             self._write_manifest(run)
             run.events.append("run_created", {"manifest": run.manifest})
             run.supervisor.transition(RunState.MODELS_READY)
@@ -425,8 +581,12 @@ class RunDaemon:
             )
             run.supervisor.transition(RunState.WORLD_READY)
             self._set_phase(run, "connecting_bot")
-            socket_path = run_dir / ".runtime" / "mineflayer.sock"
-            socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if run.containerized:
+                socket_path = run_dir / ".runtime" / "mineflayer.sock"
+                socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            else:
+                # Linux Unix-domain socket names cap at 107 path bytes; Molab's long run roots exceed that.
+                run.bridge_socket_directory, socket_path = _new_bridge_socket_path()
             workspace_root = run_dir / "agent-workspace"
             workspace = Workspace(workspace_root, events=run.events, bridge_socket=socket_path, shared_skills=self.runtime / "skills-library")
             workspace.initialize(
@@ -464,7 +624,8 @@ class RunDaemon:
                 observation = bridge.request("observe", {}, request_timeout=10)
             if observation.get("world", {}).get("game_mode") != "survival":
                 raise RuntimeError("server did not confirm the control bot entered Survival from the spectator-default world")
-            run.events.append("bot_connected", {"username": observation.get("player", {}).get("username"), "minecraft_version": config.minecraft_version, "player_uuid": bridge.ready_event.get("player_uuid") if bridge.ready_event else None})
+            player = observation.get("player") or {}
+            run.events.append("bot_connected", {"username": player.get("username"), "minecraft_version": config.minecraft_version, "player_uuid": bridge.ready_event.get("player_uuid") if bridge.ready_event else None, "health": player.get("health"), "food": player.get("food")})
             if run.containerized:
                 run.supervisor.start(
                     "network-gateway",
@@ -568,7 +729,11 @@ class RunDaemon:
             run.bridge.request("release_controls", {}, request_timeout=10)
         run.supervisor.send_command("minecraft-server", "tick freeze")
         run.supervisor.send_command("minecraft-server", "save-all flush")
-        self.pi.request("pause_run", {"run_id": run.run_id}, timeout=10)
+        try:
+            self.pi.request("pause_run", {"run_id": run.run_id}, timeout=30)
+        except Exception:
+            run.supervisor.send_command("minecraft-server", "tick unfreeze")
+            raise
         with self.lock:
             if run.running_since is not None:
                 run.active_seconds_at_pause += time.monotonic() - run.running_since
@@ -592,10 +757,11 @@ class RunDaemon:
             self.pi.request("resume_run", {"run_id": run.run_id}, timeout=10)
         except RuntimeError:
             remaining = max(0.0, run.duration_hours * 3600 - run.active_seconds_at_pause)
+            bridge_socket = run.workspace.bridge_socket if run.workspace else run.run_directory / ".runtime/mineflayer.sock"
             self.pi.request("start_run", {
                 "run_id": run.run_id, "kind": run.kind, "goal": run.goal, "objective": run.objective,
                 "workspace": str(run.run_directory / "agent-workspace"), "run_directory": str(run.run_directory),
-                "bridge_socket": str(run.run_directory / ".runtime/mineflayer.sock"), "viewer_url": run.viewer_url,
+                "bridge_socket": str(bridge_socket), "viewer_url": run.viewer_url,
                 "duration_seconds": remaining, "model_id": run.model.get("id"),
             }, timeout=30)
         with self.lock:
@@ -637,7 +803,6 @@ class RunDaemon:
             run.phase = final_state
             run.error = None if final_state in {"passed", "time_limit", "stopped"} else run.error
             run.events.append("run_stopped", {"status": final_state, "controls_released": True, "server_saved": True})
-            self._build_video(run)
         except Exception as exc:
             run.error = str(exc)[:500]
             run.state = "failed"
@@ -648,6 +813,9 @@ class RunDaemon:
             except Exception:
                 pass
             run.docker_network = None
+            if run.bridge_socket_directory:
+                shutil.rmtree(run.bridge_socket_directory, ignore_errors=True)
+                run.bridge_socket_directory = None
             with self.lock:
                 self.previous_run = self._run_summary(run)
                 self._write_service_state()
@@ -667,7 +835,6 @@ class RunDaemon:
             run.supervisor.stop_all()
             if run.containerized:
                 cleanup_run_containers(run.run_id)
-            self._build_video(run)
         except Exception as exc:
             run.error = (run.error or "") + f"; cleanup: {str(exc)[:200]}"
         finally:
@@ -676,6 +843,9 @@ class RunDaemon:
             except Exception:
                 pass
             run.docker_network = None
+            if run.bridge_socket_directory:
+                shutil.rmtree(run.bridge_socket_directory, ignore_errors=True)
+                run.bridge_socket_directory = None
 
     def _on_run_finished_locked(self, run: ActiveRun, status: str, active_seconds: int) -> None:
         run.active_seconds_at_pause = max(run.active_seconds_at_pause, float(active_seconds))
@@ -719,6 +889,58 @@ class RunDaemon:
             raise ValueError("tool arguments must be an object")
         return run.workspace.execute(name, arguments)
 
+    def workspace_tree(self, run_id: str) -> dict[str, Any]:
+        with self.lock:
+            known = run_id == (self.active.run_id if self.active else None) or run_id == (self.previous_run or {}).get("run_id")
+        if not known:
+            raise ValueError("workspace is not available for this run")
+        runs_root = (self.runtime / "runs").resolve()
+        run_root = (runs_root / run_id).resolve()
+        if run_root.parent != runs_root or run_root.name != run_id:
+            raise ValueError("invalid run workspace")
+        workspace_root = run_root / "agent-workspace"
+        if workspace_root.is_symlink() or not workspace_root.is_dir():
+            return {"run_id": run_id, "tree": [], "truncated": False}
+
+        budget = [800]
+        truncated = [False]
+
+        def scan(directory: Path, relative: str, depth: int) -> list[dict[str, Any]]:
+            nodes = []
+            try:
+                entries = sorted(os.scandir(directory), key=lambda entry: (not entry.is_dir(follow_symlinks=False), entry.name.casefold()))
+            except OSError:
+                return nodes
+            for entry in entries:
+                if entry.name in {".runtime", ".history", ".git", "node_modules"}:
+                    continue
+                if budget[0] <= 0:
+                    truncated[0] = True
+                    break
+                budget[0] -= 1
+                path = f"{relative}/{entry.name}" if relative else entry.name
+                node = {"name": entry.name, "path": path}
+                try:
+                    if entry.is_symlink():
+                        node["kind"] = "link"
+                    elif entry.is_dir(follow_symlinks=False):
+                        node["kind"] = "directory"
+                        if depth < 8:
+                            node["children"] = scan(Path(entry.path), path, depth + 1)
+                        else:
+                            node["children"] = []
+                            truncated[0] = True
+                    elif entry.is_file(follow_symlinks=False):
+                        node["kind"] = "file"
+                    else:
+                        node["kind"] = "other"
+                except OSError:
+                    node["kind"] = "other"
+                nodes.append(node)
+            return nodes
+
+        return {"run_id": run_id, "tree": scan(workspace_root, "", 0), "truncated": truncated[0]}
+
     def agent_event(self, params: dict[str, Any]) -> dict[str, Any]:
         run = self.active
         if not run or params.get("run_id") != run.run_id:
@@ -727,6 +949,22 @@ class RunDaemon:
         payload = params.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("event payload must be an object")
+        if event_type == "model_stream":
+            request_id = str(payload.get("request_id", ""))[:120]
+            if not request_id:
+                raise ValueError("model stream update requires a request ID")
+            with self.lock:
+                current = run.live_message
+                if payload.get("active") is False:
+                    if current and current.get("request_id") == request_id:
+                        run.live_message = None
+                else:
+                    if not current or current.get("request_id") != request_id or payload.get("reset"):
+                        current = {"request_id": request_id, "model": str(payload.get("model", "model"))[:100], "text": ""}
+                        run.live_message = current
+                    delta = str(payload.get("delta", ""))[:2000]
+                    current["text"] = (current.get("text", "") + delta)[:12_000]
+            return {"status": "updated"}
         event = run.events.append(event_type, payload)
         return {"sequence": event["sequence"]}
 
@@ -758,20 +996,14 @@ class RunDaemon:
             raise RuntimeError("run id is stale")
         with self.lock:
             self._on_run_finished_locked(run, str(params.get("status", "failed")), int(params.get("active_elapsed_seconds", 0)))
-            run.events.append("agent_run_finished", {"status": params.get("status"), "active_elapsed_seconds": params.get("active_elapsed_seconds"), "turns": params.get("turns")})
+            run.events.append("agent_run_finished", {
+                "status": params.get("status"),
+                "active_elapsed_seconds": params.get("active_elapsed_seconds"),
+                "turns": params.get("turns"),
+                "final_observation": params.get("final_observation"),
+            })
             self._write_service_state()
         return {"status": run.state}
-
-    def set_observer(self, username: str) -> dict[str, Any]:
-        run = self.active
-        if not run or run.state not in self.ACTIVE_STATES:
-            raise RuntimeError("there is no active world")
-        if not username or len(username) > 16 or not username.replace("_", "").isalnum() or username.casefold() == "agent":
-            raise ValueError("enter the Mac player's Minecraft username (1–16 letters, digits, or underscores)")
-        run.supervisor.send_command("minecraft-server", f"gamemode spectator {username}")
-        run.observer_username = username
-        run.events.append("observer_spectator_requested", {"username": username})
-        return {"status": "spectator_command_sent", "username": username}
 
     def export_run(self) -> dict[str, Any]:
         run = self.active
@@ -802,30 +1034,47 @@ class RunDaemon:
                     if relative.parts[:2] == (".runtime", "chrome") or file.suffix == ".sock":
                         continue
                     if file.is_file() and not file.is_symlink():
-                        archive.write(file, (Path(root_name) / relative).as_posix())
+                        archive_name = (Path(root_name) / relative).as_posix()
+                        if root_name == "run" and relative.as_posix() == "events/events.jsonl":
+                            with archive.open(archive_name, "w") as target_file, file.open("r", encoding="utf-8") as source_file:
+                                for line in source_file:
+                                    try:
+                                        event = json.loads(line)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    visible = _visible_event(event) if isinstance(event, dict) else None
+                                    if visible is not None:
+                                        target_file.write((json.dumps(visible, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+                            continue
+                        archive.write(file, archive_name)
+            manifest_path = run_dir / "manifest.json"
+            events_path = run_dir / "events/events.jsonl"
+            if manifest_path.is_file() and events_path.is_file():
+                from .rollouts import build_rollout_export
+
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                event_rows = []
+                for line in events_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        event_rows.append(item)
+                episode, transitions = build_rollout_export(manifest, event_rows)
+                archive.writestr("run/rollout/episode.json", json.dumps(episode, ensure_ascii=False, indent=2) + "\n")
+                archive.writestr(
+                    "run/rollout/transitions.jsonl",
+                    "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in transitions),
+                )
         os.replace(temp, target)
-        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with target.open("rb") as archive_file:
+            while chunk := archive_file.read(1024 * 1024):
+                digest.update(chunk)
         if run:
-            run.events.append("evidence_exported", {"path": str(target), "sha256": digest, "bytes": target.stat().st_size})
-        return {"path": str(target), "sha256": digest, "bytes": target.stat().st_size}
-
-    @staticmethod
-    def _build_video(run: ActiveRun) -> dict[str, Any]:
-        frames = run.run_directory / "media" / "frames"
-        if not frames.is_dir() or not list(frames.glob("frame-*.png")):
-            return {"status": "unavailable", "reason": "no Prismarine Viewer frames were captured"}
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            return {"status": "unavailable", "reason": "ffmpeg is not installed; individual evidence frames remain available"}
-        output = run.run_directory / "media" / "practice.mp4"
-        result = subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-framerate", "1", "-pattern_type", "glob", "-i", str(frames / "frame-*.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)],
-            capture_output=True, text=True, timeout=300, check=False,
-        )
-        if result.returncode:
-            return {"status": "failed", "error": result.stderr[-500:]}
-        return {"status": "ready", "path": str(output), "bytes": output.stat().st_size, "frame_count": len(list(frames.glob("frame-*.png"))), "fps": 1}
-
+            run.events.append("evidence_exported", {"path": str(target), "sha256": digest.hexdigest(), "bytes": target.stat().st_size})
+        return {"path": str(target), "sha256": digest.hexdigest(), "bytes": target.stat().st_size}
 
 def main() -> None:
     daemon = RunDaemon()

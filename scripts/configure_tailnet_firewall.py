@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Limit only the notebook, viewer, and Minecraft ports to the operator Mac."""
+"""Limit the app, viewer, and Minecraft ports to the paired computer."""
 
 from __future__ import annotations
 

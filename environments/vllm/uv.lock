@@ -1106,23 +1106,6 @@ wheels = [
 ]
 
 [[package]]
-name = "minecraft-agent-harness"
-version = "0.1.0"
-source = { editable = "../../" }
-
-[package.metadata]
-requires-dist = [
-    { name = "anywidget", marker = "extra == 'notebook'", specifier = "==0.9.21" },
-    { name = "boto3", marker = "extra == 'notebook'", specifier = "==1.42.32" },
-    { name = "boto3", marker = "extra == 'storage'", specifier = "==1.42.32" },
-    { name = "huggingface-hub", marker = "extra == 'notebook'", specifier = "==1.7.1" },
-    { name = "huggingface-hub", marker = "extra == 'storage'", specifier = "==1.7.1" },
-    { name = "marimo", marker = "extra == 'notebook'", specifier = "==0.23.11" },
-    { name = "pillow", marker = "extra == 'notebook'", specifier = "==12.3.0" },
-]
-provides-extras = ["notebook", "storage"]
-
-[[package]]
 name = "minecraft-agent-nemotron-runtime"
 version = "0.1.0"
 source = { virtual = "." }
@@ -1130,7 +1113,6 @@ dependencies = [
     { name = "cuda-toolkit", extra = ["all"] },
     { name = "flashinfer-cubin" },
     { name = "flashinfer-jit-cache" },
-    { name = "minecraft-agent-harness" },
     { name = "ninja" },
     { name = "vllm" },
 ]
@@ -1140,7 +1122,6 @@ requires-dist = [
     { name = "cuda-toolkit", extras = ["all"], specifier = "==13.0.3.0" },
     { name = "flashinfer-cubin", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-jit-cache", specifier = "==0.7.0.post1+cu130", index = "https://flashinfer.ai/whl/cu130/" },
-    { name = "minecraft-agent-harness", editable = "../../" },
     { name = "ninja", specifier = ">=1.11,<2" },
     { name = "vllm", specifier = "==0.32.0" },
 ]

@@ -18,7 +18,6 @@ const version = process.env.MINECRAFT_VERSION || '1.21.4';
 const runId = process.env.RUN_ID || 'local-smoke';
 const maxActionMs = Number(process.env.MAX_ACTION_MS || 2000);
 const maxObservationEntities = 32;
-const maxViewerBlocks = 512;
 const programSocketPath = process.env.MINECRAFT_AGENT_SOCKET;
 
 const isTailnetHost = (() => {
@@ -44,11 +43,7 @@ const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity 
 const recentEvents = [];
 const completedActions = new Map();
 let ready = false;
-let viewerSequence = Number(process.env.MINECRAFT_VIEWER_SEQUENCE_OFFSET || 0);
-if (!Number.isSafeInteger(viewerSequence) || viewerSequence < 0) viewerSequence = 0;
 let handling = Promise.resolve();
-let lastPhysicsTick = performance.now();
-const physicsTickIntervals = [];
 const placedDiamondBlocks = [];
 const completedAdvancements = new Set();
 let programServer = null;
@@ -95,12 +90,6 @@ bot._client.on('advancements', (packet) => {
       completedAdvancements.add(key);
     }
   }
-});
-bot.on('physicsTick', () => {
-  const now = performance.now();
-  physicsTickIntervals.push(now - lastPhysicsTick);
-  lastPhysicsTick = now;
-  while (physicsTickIntervals.length > 200) physicsTickIntervals.shift();
 });
 bot.on('death', () => remember('death'));
 bot.on('end', () => {
@@ -324,26 +313,6 @@ async function execute(action, { includeObservation = true } = {}) {
   return result;
 }
 
-function viewerSnapshot() {
-  const started = performance.now();
-  const center = bot.entity.position.floored();
-  const position = bot.entity.position;
-  const blocks = [];
-  for (let y = -2; y <= 3 && blocks.length < maxViewerBlocks; y++) {
-    for (let x = -4; x <= 4 && blocks.length < maxViewerBlocks; x++) {
-      for (let z = -4; z <= 4 && blocks.length < maxViewerBlocks; z++) {
-        const pos = center.offset(x, y, z);
-        const block = bot.blockAt(pos);
-        if (block && block.name !== 'air') blocks.push({ name: block.name, x: pos.x, y: pos.y, z: pos.z });
-      }
-    }
-  }
-  viewerSequence += 1;
-  const sortedTicks = physicsTickIntervals.slice().sort((a, b) => a - b);
-  const tickP95 = sortedTicks.length ? sortedTicks[Math.floor((sortedTicks.length - 1) * 0.95)] : null;
-  return { sequence: viewerSequence, full_resync: true, center: { x: center.x, y: center.y, z: center.z }, player: { position: { x: position.x, y: position.y, z: position.z }, yaw: bot.entity.yaw, pitch: bot.entity.pitch, sneaking: Boolean(bot.getControlState('sneak')) }, blocks, dropped_stale_updates: 0, source: 'mineflayer_loaded_region', capture_ms: performance.now() - started, physics_tick_samples: sortedTicks.length, physics_tick_p95_ms: tickP95 };
-}
-
 async function handle(request) {
   if (!request || request.version !== 1 || typeof request.request_id !== 'string' || typeof request.method !== 'string' || !request.params || typeof request.params !== 'object') throw new Error('invalid version 1 request envelope');
   if (request.method === 'execute' && typeof request.params.action_id === 'string' && completedActions.has(request.params.action_id)) {
@@ -351,8 +320,6 @@ async function handle(request) {
   }
   if (!ready && request.method !== 'stop') throw new Error('bot is not ready');
   if (request.method === 'observe') return boundedObservation();
-  if (request.method === 'viewer_snapshot') return viewerSnapshot();
-  if (request.method === 'capture_image') return { status: 'not_available_in_bridge', source: 'marimo_prismarine_viewer_widget', message: 'The current JPEG frame is supplied by the embedded notebook widget.' };
   if (request.method === 'verify_goal') return verifyGoal(request.params.goal || 'diamond_block_placed');
   if (request.method === 'release_controls') {
     const program = programRunner.cancelProgram();
