@@ -176,7 +176,8 @@ const client = net.createConnection(socketPath);
 let data = '';
 const timer = setTimeout(() => { client.destroy(); fail(`program response exceeded ${timeout + 10} seconds`); }, (timeout + 10) * 1000);
 client.setEncoding('utf8');
-client.once('connect', () => client.end(`${JSON.stringify(request)}\n`));
+// The newline frames this request; keep the writable half open until its async response arrives.
+client.once('connect', () => client.write(`${JSON.stringify(request)}\n`));
 client.on('data', (chunk) => {
   data += chunk;
   if (Buffer.byteLength(data) > 1_000_000) { client.destroy(); fail('response exceeded 1 MB'); }

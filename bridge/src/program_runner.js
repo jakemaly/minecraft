@@ -55,6 +55,9 @@ function createProgramRunner({ bot, isReady, remember, requireFn = require, glob
     const started = performance.now();
     let timer;
     let status = 'completed';
+    const guardedExportEntrypoint = /\b(?:async\s+)?function\s+run\s*\(\s*bot\s*\)/.test(source)
+      && /\btypeof\s+bot\s*!==?\s*(['"])undefined\1/.test(source)
+      && /\bmodule\.exports\s*=\s*run\b/.test(source);
     const usesProcessExit = /\bprocess\b[\s\S]{0,80}(?:\.\s*exit|\[\s*['"]exit['"]\s*\])/.test(source);
     let resolveProgramExit;
     let programExitCode;
@@ -117,7 +120,9 @@ function createProgramRunner({ bot, isReady, remember, requireFn = require, glob
       });
       const result = await Promise.race([
         (async () => {
-          const bodyResult = await executeProgram(programBot, programRequire, programGlobal, scopedConsole, controller.signal, moduleObject, moduleObject.exports, programProcess, programGlobal);
+          // Generated wrappers branch to module.exports when no top-level bot is supplied; let the runner invoke that entrypoint under its timeout.
+          const scriptBot = guardedExportEntrypoint ? undefined : programBot;
+          const bodyResult = await executeProgram(scriptBot, programRequire, programGlobal, scopedConsole, controller.signal, moduleObject, moduleObject.exports, programProcess, programGlobal);
           if (bodyResult === undefined && usesProcessExit) {
             const exitCode = await programExit;
             if (exitCode !== 0) throw new Error(`program requested exit with code ${exitCode}`);

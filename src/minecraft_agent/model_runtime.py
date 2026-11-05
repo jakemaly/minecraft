@@ -20,6 +20,8 @@ LOCAL_PROVIDER_ID = "molab-vllm"
 MAX_NUM_SEQS = 1
 MAX_NUM_BATCHED_TOKENS = 8192
 GPU_MEMORY_UTILIZATION = 0.89
+MAMBA_BACKEND = "triton"
+MAMBA_SSM_CACHE_DTYPE = "float16"
 
 
 def download_nemotron(cache_dir: str | Path, token: str | None = None) -> Path:
@@ -63,6 +65,10 @@ def inference_config(base_url: str = LOCAL_VLLM_BASE_URL) -> dict:
         "max_num_seqs": MAX_NUM_SEQS,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+        "mamba_backend": MAMBA_BACKEND,
+        "mamba_ssm_cache_dtype": MAMBA_SSM_CACHE_DTYPE,
+        "mamba_cache_mode": "align",
+        "mamba_cache_stochastic_rounding": False,
         "tool_call_parser": "qwen3_coder",
         "reasoning_parser": "nemotron_v3",
     }
@@ -114,8 +120,7 @@ def start_nemotron(supervisor, run_dir: str | Path, model_path: str | Path):
         "--max-model-len", str(NEMOTRON_MAX_MODEL_LEN), "--max-num-seqs", str(MAX_NUM_SEQS),
         "--max-num-batched-tokens", str(MAX_NUM_BATCHED_TOKENS), "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--enable-prefix-caching", "--enable-mamba-shared-prefix-checkpoint",
-        "--mamba-backend", "flashinfer", "--mamba-ssm-cache-dtype", "float16",
-        "--enable-mamba-cache-stochastic-rounding", "--mamba-cache-philox-rounds", "5",
+        "--mamba-backend", MAMBA_BACKEND, "--mamba-ssm-cache-dtype", MAMBA_SSM_CACHE_DTYPE,
         "--mamba-cache-mode", "align", "--video-pruning-rate", "0.5",
         "--media-io-kwargs", '{"video":{"fps":2,"num_frames":256}}',
         "--reasoning-parser", "nemotron_v3", "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder", "--trust-remote-code",
