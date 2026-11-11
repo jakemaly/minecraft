@@ -23,6 +23,7 @@ class PiClient:
         self._pending_lock = threading.Lock()
         self._pending: dict[str, tuple[threading.Event, dict[str, Any] | None]] = {}
         self._stderr_tail: list[str] = []
+        self._reader_threads: list[threading.Thread] = []
 
     def start(self) -> None:
         agent_dir = self.runtime / "pi"
@@ -49,8 +50,12 @@ class PiClient:
             bufsize=1,
             start_new_session=True,
         )
-        threading.Thread(target=self._read_stdout, name="pi-agent-events", daemon=True).start()
-        threading.Thread(target=self._read_stderr, name="pi-agent-stderr", daemon=True).start()
+        self._reader_threads = [
+            threading.Thread(target=self._read_stdout, name="pi-agent-events", daemon=True),
+            threading.Thread(target=self._read_stderr, name="pi-agent-stderr", daemon=True),
+        ]
+        for thread in self._reader_threads:
+            thread.start()
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -116,16 +121,25 @@ class PiClient:
                 self._pending.pop(request_id, None)
 
     def stop(self) -> None:
-        if not self.process or self.process.poll() is not None:
+        if not self.process:
             return
+        process = self.process
         try:
-            self.request("shutdown", timeout=5)
-        except (OSError, RuntimeError, TimeoutError):
-            self.process.terminate()
-        if self.process.stdin:
-            self.process.stdin.close()
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+            if process.poll() is None:
+                try:
+                    self.request("shutdown", timeout=5)
+                except (OSError, RuntimeError, TimeoutError):
+                    process.terminate()
+                if process.stdin:
+                    process.stdin.close()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        finally:
+            for thread in self._reader_threads:
+                thread.join(timeout=2)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream and not stream.closed:
+                    stream.close()

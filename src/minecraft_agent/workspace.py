@@ -22,10 +22,8 @@ from typing import Any
 TOOL_NAMES = ("read", "write", "edit", "bash", "grep", "find", "ls")
 _OUTPUT_LIMIT = 12_000
 _REVISION_LIMIT = 24_000
-
-
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+_REVISION_TEXT_BUDGET = 256_000
+_REVISION_TEXT_FILE_LIMIT = 64_000
 
 
 def _bounded(text: str, limit: int = _OUTPUT_LIMIT) -> tuple[str, bool]:
@@ -43,7 +41,7 @@ class Workspace:
         self.bridge_socket = Path(bridge_socket).resolve() if bridge_socket else None
         self.shared_skills = Path(shared_skills).resolve() if shared_skills else None
         self._lock = threading.RLock()
-        self._active_process: subprocess.Popen[str] | None = None
+        self._active_process: subprocess.Popen[bytes] | None = None
         self._active_container_idfile: Path | None = None
         from .sandbox import probe
         self.sandbox = probe()
@@ -59,14 +57,14 @@ class Workspace:
             "# Reusable skills\n\n"
             "Create one folder per ability, with a `SKILL.md` that starts with a one-sentence description and then gives the reliable procedure. "
             "Add a `test.sh` that checks the procedure's scripts, run it, then publish the version with `mc-skill publish skills/<name>`. "
-            "Published versions appear under `library/` in later trials. Discover skills with `find` and read the selected `SKILL.md` before use.\n",
+            "Published versions appear under `library/` in later workspaces. Discover skills with `find` and read the selected `SKILL.md` before use.\n",
             encoding="utf-8",
         )
         (self.root / "README.md").write_text(
             "# Agent workspace\n\n"
             "Use `scripts/` for programs, `skills/` for tested reusable abilities, "
-            "and `docs/` for the installed Mineflayer APIs. Record verified "
-            "learnings in `memory.md`; keep `plan.md` focused on the active goal.\n",
+            "and `docs/` for the installed Mineflayer APIs. Keep `memory.md` "
+            "short and run-specific; keep `plan.md` focused on verified goal progress.\n",
             encoding="utf-8",
         )
         if mineflayer_docs:
@@ -149,6 +147,7 @@ class Workspace:
         script = r'''#!/usr/bin/env node
 'use strict';
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const net = require('node:net');
 const path = require('node:path');
 
@@ -174,15 +173,23 @@ if (!socketPath) fail('live Mineflayer session is unavailable');
 const request = { version: 1, method: 'run_program', source: fs.readFileSync(target, 'utf8'), script: path.relative(root, target), timeout_seconds: timeout };
 const client = net.createConnection(socketPath);
 let data = '';
-const timer = setTimeout(() => { client.destroy(); fail(`program response exceeded ${timeout + 10} seconds`); }, (timeout + 10) * 1000);
+let timedOut = false;
+const started = Date.now();
+const timer = setTimeout(() => {
+  timedOut = true;
+  client.destroy();
+  const result = { status: 'timeout', program_id: null, script: request.script, sha256: crypto.createHash('sha256').update(request.source).digest('hex'), output: [], error_type: 'TimeoutError', error: 'program deadline exceeded', duration_seconds: (Date.now() - started) / 1000, controls_released: false };
+  process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(124));
+}, timeout * 1000 + 250);
 client.setEncoding('utf8');
 client.once('connect', () => client.end(`${JSON.stringify(request)}\n`));
 client.on('data', (chunk) => {
   data += chunk;
   if (Buffer.byteLength(data) > 1_000_000) { client.destroy(); fail('response exceeded 1 MB'); }
 });
-client.once('error', (error) => { clearTimeout(timer); fail(error.message); });
+client.once('error', (error) => { if (!timedOut) { clearTimeout(timer); fail(error.message); } });
 client.once('close', () => {
+  if (timedOut) return;
   clearTimeout(timer);
   try {
     const response = JSON.parse(data);
@@ -211,12 +218,10 @@ client.once('close', () => {
 
     def _sandbox_command(self, command: str, timeout_seconds: float) -> tuple[list[str], Path | None]:
         """Confine shell helpers to the run workspace and the bot capability socket."""
-        import shutil
-
         bwrap = shutil.which("bwrap")
         prlimit = shutil.which("prlimit")
         if not self.sandbox.available:
-            return ["bash", "-c", command], None
+            raise RuntimeError(f"workspace shell execution requires an available sandbox: {self.sandbox.reason}")
 
         bridge_root = Path(__file__).resolve().parents[2] / "bridge"
         env = self.environment()
@@ -254,7 +259,7 @@ client.once('close', () => {
         if self.sandbox.backend == "docker" and self.sandbox.image:
             docker = shutil.which("docker")
             if not docker:
-                return ["bash", "-c", command], None
+                raise RuntimeError("workspace Docker sandbox is unavailable: Docker CLI is missing")
             cid_dir = self.root.parent / ".runtime"
             cid_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             cidfile = cid_dir / f"shell-{uuid.uuid4().hex}.cid"
@@ -277,7 +282,7 @@ client.once('close', () => {
                 argv.extend(("--env", f"MINECRAFT_VERSION={env['MINECRAFT_VERSION']}"))
             argv.extend((self.sandbox.image, "-c", command))
             return argv, cidfile
-        return ["bash", "-c", command], None
+        raise RuntimeError(f"workspace sandbox backend is unavailable: {self.sandbox.backend or 'unknown'}")
 
     def _kill_sandbox_container(self, cidfile: Path | None) -> None:
         if not cidfile:
@@ -302,8 +307,9 @@ client.once('close', () => {
             raise ValueError("path must stay inside this run's workspace")
         return candidate
 
-    def _snapshot(self) -> dict[str, bytes]:
-        result: dict[str, bytes] = {}
+    def _snapshot(self) -> dict[str, tuple[str, str | None]]:
+        result: dict[str, tuple[str, str | None]] = {}
+        text_budget = _REVISION_TEXT_BUDGET
         for path in self.root.rglob("*"):
             if not path.is_file() or path.is_symlink() or ".history" in path.parts:
                 continue
@@ -311,23 +317,31 @@ client.once('close', () => {
             if relative.startswith(".runtime/"):
                 continue
             try:
-                result[relative] = path.read_bytes()
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        digest.update(chunk)
+                size = path.stat().st_size
+                text = None
+                if path.suffix in {".js", ".py", ".md", ".json", ".sh"} and size <= min(text_budget, _REVISION_TEXT_FILE_LIMIT):
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    text_budget -= size
+                result[relative] = (digest.hexdigest(), text)
             except OSError:
                 continue
         return result
 
-    def _record_revision(self, tool: str, before: dict[str, bytes], after: dict[str, bytes]) -> None:
+    def _record_revision(self, tool: str, before: dict[str, tuple[str, str | None]], after: dict[str, tuple[str, str | None]]) -> None:
         changed = []
         for path in sorted(before.keys() | after.keys()):
-            old, new = before.get(path), after.get(path)
-            if old == new:
+            old_hash, old_text = before.get(path, (None, None))
+            new_hash, new_text = after.get(path, (None, None))
+            if old_hash == new_hash:
                 continue
-            old_hash = _sha256(old) if old is not None else None
-            new_hash = _sha256(new) if new is not None else None
             diff = ""
-            if path.endswith((".js", ".py", ".md", ".json", ".sh")) and (old or new):
-                old_lines = (old or b"").decode("utf-8", errors="replace").splitlines()
-                new_lines = (new or b"").decode("utf-8", errors="replace").splitlines()
+            if path.endswith((".js", ".py", ".md", ".json", ".sh")) and (old_text is not None or new_text is not None):
+                old_lines = (old_text or "").splitlines()
+                new_lines = (new_text or "").splitlines()
                 diff, _ = _bounded("\n".join(difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="")), _REVISION_LIMIT)
             changed.append({"path": path, "old_sha256": old_hash, "sha256": new_hash, "diff": diff})
         if changed and self.events:
@@ -364,7 +378,9 @@ client.once('close', () => {
         target.write_text(content, encoding="utf-8")
         after = self._snapshot()
         self._record_revision("write", before, after)
-        return {"path": target.relative_to(self.root).as_posix(), "bytes": target.stat().st_size, "sha256": _sha256(target.read_bytes())}
+        with target.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        return {"path": target.relative_to(self.root).as_posix(), "bytes": target.stat().st_size, "sha256": digest}
 
     def _edit(self, path: str, old: str, new: str, replace_all: bool = False) -> dict[str, Any]:
         target = self._resolve(path)
@@ -381,7 +397,9 @@ client.once('close', () => {
         target.write_text(updated, encoding="utf-8")
         after = self._snapshot()
         self._record_revision("edit", before, after)
-        return {"path": target.relative_to(self.root).as_posix(), "replacements": count if replace_all else 1, "sha256": _sha256(target.read_bytes())}
+        with target.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        return {"path": target.relative_to(self.root).as_posix(), "replacements": count if replace_all else 1, "sha256": digest}
 
     def _bash(self, command: str, timeout_seconds: float = 60) -> dict[str, Any]:
         if not isinstance(command, str) or not command.strip():
@@ -403,25 +421,65 @@ client.once('close', () => {
         process = subprocess.Popen(
             sandbox_argv, cwd=self.root, env=self.environment(),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+            start_new_session=True,
         )
         with self._lock:
             self._active_process = process
             self._active_container_idfile = cidfile
         status = "completed"
+        captured: dict[str, tuple[str, bool]] = {}
+
+        def drain(name: str, stream) -> None:
+            output = bytearray()
+            truncated = False
+            while chunk := stream.read(64 * 1024):
+                keep = max(0, _OUTPUT_LIMIT - len(output))
+                output.extend(chunk[:keep])
+                truncated = truncated or len(chunk) > keep
+            text = output.decode("utf-8", errors="replace")
+            if truncated:
+                text += "\n… output truncated; use a narrower query or request full output"
+            captured[name] = (text, truncated)
+
+        readers = [
+            threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+            threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout_seconds
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            status = "timeout"
             try:
-                self._kill_sandbox_container(cidfile)
-                os.killpg(process.pid, signal.SIGTERM)
-                stdout, stderr = process.communicate(timeout=3)
+                process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
-                self._kill_sandbox_container(cidfile)
-                os.killpg(process.pid, signal.SIGKILL)
-                stdout, stderr = process.communicate()
+                status = "timeout"
+            if status == "completed":
+                for reader in readers:
+                    reader.join(max(0, deadline - time.monotonic()))
+                if any(reader.is_alive() for reader in readers):
+                    status = "timeout"
+            if status == "timeout":
+                try:
+                    self._kill_sandbox_container(cidfile)
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._kill_sandbox_container(cidfile)
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                for reader in readers:
+                    reader.join(timeout=3)
         finally:
+            for reader in readers:
+                reader.join(timeout=3)
+            process.stdout.close()
+            process.stderr.close()
             with self._lock:
                 if self._active_process is process:
                     self._active_process = None
@@ -430,8 +488,8 @@ client.once('close', () => {
                 cidfile.unlink(missing_ok=True)
         after = self._snapshot()
         self._record_revision("bash", before, after)
-        out, out_truncated = _bounded(stdout)
-        err, err_truncated = _bounded(stderr)
+        out, out_truncated = captured["stdout"]
+        err, err_truncated = captured["stderr"]
         return {"status": status, "exit_code": process.returncode, "stdout": out, "stderr": err, "stdout_truncated": out_truncated, "stderr_truncated": err_truncated, "sandbox": self.sandbox.reason}
 
     def _publish_skill(self, path: str, timeout_seconds: float) -> dict[str, Any]:
@@ -462,7 +520,8 @@ client.once('close', () => {
             if not item.is_file():
                 continue
             relative = item.relative_to(source).as_posix()
-            file_hash = _sha256(item.read_bytes())
+            with item.open("rb") as stream:
+                file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
             files.append({"path": relative, "sha256": file_hash, "bytes": item.stat().st_size})
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
@@ -565,7 +624,7 @@ def tool_schemas() -> list[dict[str, Any]]:
         {"name": "read", "description": "Read a workspace file; use full=true to avoid default truncation.", "parameters": {"path": "string", "full": "boolean?"}},
         {"name": "write", "description": "Create or replace a workspace file.", "parameters": {"path": "string", "content": "string"}},
         {"name": "edit", "description": "Replace exact text in one workspace file.", "parameters": {"path": "string", "old": "string", "new": "string", "replace_all": "boolean?"}},
-        {"name": "bash", "description": "Run a shell command from the workspace; timeout defaults to 60 seconds. Set it at least 10 seconds longer than an mc-run script timeout.", "parameters": {"command": "string", "timeout_seconds": "number?"}},
+        {"name": "bash", "description": "Run a shell command from the workspace; timeout defaults to 60 seconds. Set it at least 1 second longer than an mc-run script timeout to receive its structured result.", "parameters": {"command": "string", "timeout_seconds": "number?"}},
         {"name": "grep", "description": "Search workspace text by regular expression.", "parameters": {"pattern": "string", "path": "string?", "ignore_case": "boolean?", "max_matches": "integer?"}},
         {"name": "find", "description": "Find workspace paths by glob.", "parameters": {"path": "string?", "pattern": "string?", "max_results": "integer?"}},
         {"name": "ls", "description": "List one workspace directory; all=true includes hidden entries.", "parameters": {"path": "string?", "all": "boolean?"}},

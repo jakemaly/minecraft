@@ -16,7 +16,7 @@ function createProgramRunner({ bot, isReady, remember, requireFn = require, glob
     if (!isReady()) throw new Error('bot is not ready');
     const source = request.source;
     const timeoutSeconds = Number(request.timeout_seconds ?? 60);
-    if (typeof source !== 'string' || !source.trim() || Buffer.byteLength(source, 'utf8') > 256_000) throw new Error('program source must be non-empty and at most 256 KiB');
+    if (typeof source !== 'string' || !source.trim() || Buffer.byteLength(source, 'utf8') > 256_000) throw new Error('program source must be non-empty and at most 256,000 UTF-8 bytes');
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 43200) throw new Error('program timeout must be between 1 second and 12 hours');
 
     const controller = new AbortController();

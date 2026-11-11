@@ -16,15 +16,10 @@ SOURCE_PATHS = (
     "bridge/test",
     "scripts",
     "schemas",
-    "viewer",
     "deploy",
     "tests",
     "pyproject.toml",
     "uv.lock",
-    "environments/planner/pyproject.toml",
-    "environments/planner/uv.lock",
-    "environments/clef/pyproject.toml",
-    "environments/clef/uv.lock",
     "bridge/package.json",
     "bridge/package-lock.json",
 )
@@ -66,8 +61,7 @@ def source_identity(root: str | Path) -> dict[str, Any]:
     locks = {
         name: file_hashes[name]
         for name in (
-            "uv.lock", "environments/planner/uv.lock",
-            "environments/clef/uv.lock", "bridge/package-lock.json",
+            "uv.lock", "bridge/package-lock.json",
         )
         if name in file_hashes
     }

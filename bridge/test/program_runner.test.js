@@ -2,7 +2,14 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const Ajv = require('ajv');
+const programSchema = require('../../schemas/program.v1.json');
 const { createProgramRunner } = require('../src/program_runner');
+const validateProgramResult = new Ajv({ meta: false, validateSchema: false }).compile(programSchema);
+
+function assertMatchesProgramSchema(result) {
+  assert.ok(validateProgramResult(result), JSON.stringify(validateProgramResult.errors));
+}
 
 function fixture() {
   const bot = {
@@ -24,7 +31,9 @@ test('runs a multi-step async program with persistent global state and bounded l
     script: 'scripts/step.js',
     source: "global.__runnerCount = (global.__runnerCount || 0) + 1; bot.setControlState('forward', true); await new Promise(resolve => setTimeout(resolve, 5)); bot.setControlState('forward', false); console.log('step', global.__runnerCount); return bot.position();",
   });
+  assertMatchesProgramSchema(first);
   const second = await runner.runProgram({ source: "return global.__runnerCount;" });
+  assertMatchesProgramSchema(second);
   assert.equal(first.status, 'completed');
   assert.deepEqual(first.result, { x: 3, y: 64, z: -2 });
   assert.equal(first.output[0].text, 'step 1');
@@ -39,6 +48,7 @@ test('supports an exported async Mineflayer program with the live bot', async ()
     script: 'scripts/exported.js',
     source: "module.exports = async (bot) => { bot.setControlState('forward', true); await Promise.resolve(); bot.setControlState('forward', false); console.log('exported program', bot.position()); return 9; };",
   });
+  assertMatchesProgramSchema(result);
   assert.equal(result.status, 'completed');
   assert.equal(result.result, 9);
   assert.equal(result.output[0].text, 'exported program {\"x\":3,\"y\":64,\"z\":-2}');
@@ -54,6 +64,7 @@ test('stop cancels a running program promptly and releases controls', async () =
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(runner.cancelProgram().status, 'cancellation_requested');
   const result = await running;
+  assertMatchesProgramSchema(result);
   assert.equal(result.status, 'cancelled');
   assert.equal(result.controls_released, true);
   assert.equal(runner.activeProgram, null);
@@ -67,6 +78,8 @@ test('deadline and program errors have distinct statuses and release controls', 
     timeout_seconds: 1,
   });
   const failure = await runner.runProgram({ source: "throw new Error('script bug');" });
+  assertMatchesProgramSchema(timeout);
+  assertMatchesProgramSchema(failure);
   assert.equal(timeout.status, 'timeout');
   assert.equal(failure.status, 'failed');
   assert.equal(timeout.controls_released, true);

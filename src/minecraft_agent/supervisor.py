@@ -22,7 +22,6 @@ class RunState(StrEnum):
     WORLD_READY = "world_ready"
     RUNNING = "running"
     PAUSED = "paused"
-    CHECKPOINTING = "checkpointing"
     STOPPED = "stopped"
     FAILED = "failed"
 
@@ -52,9 +51,7 @@ class Supervisor:
         self.state = RunState.PREFLIGHT
         self.processes: dict[str, ManagedProcess] = {}
         self._lock = threading.RLock()
-        self._action_lock = threading.Lock()
         self._stdin_lock = threading.Lock()
-        self._action_results: dict[str, dict] = {}
         self._cleaned_up = False
         atexit.register(self._cleanup_for_exit)
         self._write_state()
@@ -145,22 +142,13 @@ class Supervisor:
             except OSError:
                 pass
 
-    def run_once(self, action_id: str, action) -> dict:
-        with self._action_lock:
-            if action_id in self._action_results:
-                return self._action_results[action_id]
-            result = action()
-            self._action_results[action_id] = result
-            return result
-
     def transition(self, state: RunState) -> None:
         allowed = {
             RunState.PREFLIGHT: {RunState.MODELS_READY, RunState.WORLD_READY, RunState.FAILED, RunState.STOPPED},
             RunState.MODELS_READY: {RunState.WORLD_READY, RunState.FAILED, RunState.STOPPED},
-            RunState.WORLD_READY: {RunState.RUNNING, RunState.PAUSED, RunState.CHECKPOINTING, RunState.FAILED, RunState.STOPPED},
-            RunState.RUNNING: {RunState.PAUSED, RunState.CHECKPOINTING, RunState.FAILED, RunState.STOPPED},
-            RunState.PAUSED: {RunState.RUNNING, RunState.WORLD_READY, RunState.CHECKPOINTING, RunState.FAILED, RunState.STOPPED},
-            RunState.CHECKPOINTING: {RunState.PAUSED, RunState.STOPPED, RunState.FAILED},
+            RunState.WORLD_READY: {RunState.RUNNING, RunState.PAUSED, RunState.FAILED, RunState.STOPPED},
+            RunState.RUNNING: {RunState.PAUSED, RunState.FAILED, RunState.STOPPED},
+            RunState.PAUSED: {RunState.RUNNING, RunState.WORLD_READY, RunState.FAILED, RunState.STOPPED},
             RunState.FAILED: {RunState.STOPPED},
             RunState.STOPPED: set(),
         }
@@ -176,13 +164,18 @@ class Supervisor:
             if managed is None:
                 return
             process = managed.process
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=grace_seconds)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=grace_seconds)
+        try:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=grace_seconds)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=grace_seconds)
+        finally:
+            if process.stdin and not process.stdin.closed:
+                with self._stdin_lock:
+                    process.stdin.close()
         if managed.pump_thread:
             managed.pump_thread.join(timeout=2)
         self._write_state()

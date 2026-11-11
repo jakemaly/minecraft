@@ -61,7 +61,7 @@ def prepare_server(
     # The operator explicitly authorized continuing past the EULA gate for this private practice run.
     (root / "eula.txt").write_text("eula=true\n", encoding="utf-8")
     properties = {
-        "server-ip": bind_address, "server-port": str(port), "online-mode": "false",
+        "server-ip": bind_address, "server-port": str(port), "online-mode": "false", "hardcore": "false",
         "difficulty": "normal", "gamemode": default_gamemode, "level-type": "minecraft:normal",
         "level-seed": str(seed),
         "allow-nether": "true", "enable-command-block": "false", "enable-rcon": "false",

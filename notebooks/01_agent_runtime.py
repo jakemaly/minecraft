@@ -166,6 +166,18 @@ def _(Path, artifact, callback, connect, export, html, json, mo, observer, pause
         export,
     ])
 
+    plan_text = active.get("plan") or "The agent has not written a run plan yet."
+    checkpoint = active.get("last_saved_checkpoint")
+    checkpoint_text = (
+        f"Last world save: {html.escape(str(checkpoint.get('wall_time', 'unknown time')))}"
+        if checkpoint else "No pause-and-save checkpoint yet. The Pause button saves the world before freezing it."
+    )
+    plan_panel = mo.vstack([
+        mo.md("## Run plan and checkpoint"),
+        mo.md(checkpoint_text),
+        mo.Html(f'<pre aria-label="Current run plan" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px">{html.escape(plan_text)}</pre>'),
+    ])
+
     live_states = {"probing_model", "running", "paused"}
     viewer = None
     if active.get("viewer_url") and active.get("state") in live_states:
@@ -317,6 +329,7 @@ def _(Path, artifact, callback, connect, export, html, json, mo, observer, pause
         auth_panel,
         controls,
         refresh,
+        plan_panel,
         mo.md("## Live bot view · Prismarine Viewer"),
         viewer if viewer is not None else mo.md("Start a run to show the first-person viewer."),
         mo.md("### Latest exact image sent to the model"),
