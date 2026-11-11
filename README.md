@@ -20,9 +20,9 @@ Acacia is still a work-in-progress! Currently working on a new system to beat Ha
 
 ## Run the app
 
-On the Linux host, install Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22+, npm, Java 21+, Docker, and Tailscale. Sign in to Tailscale on both the host and the computer you will use to open the dashboard.
+Run the app on a Linux host with Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22+, npm, Java 21+, and Docker. Open the dashboard in a browser on any device that can reach the host. The included launcher uses Tailscale to provide private network access.
 
-From the repository root, install the app and bridge dependencies, then start the notebook:
+For the standard setup, connect the host and browser device to Tailscale. From the repository root, install the app and bridge dependencies, then start the notebook:
 
 ```sh
 uv sync --extra notebook
@@ -30,4 +30,4 @@ npm ci --prefix bridge
 ./scripts/run_notebook.sh
 ```
 
-Open `http://<host-tailscale-ip>:2718` from the paired computer. The script detects both Tailscale addresses; if detection fails, set `MINECRAFT_TAILSCALE_IP` and `MINECRAFT_CLIENT_TAILSCALE_IP` before starting it. Press `Ctrl+C` in the terminal to stop the app.
+Open `http://<server-address>:2718` from your browser. With the included launcher, use the host's Tailscale IP; it detects the address automatically. Press `Ctrl+C` in the terminal to stop the app.
