@@ -17,3 +17,22 @@ Acacia represents a fundamental shift in AI systems, with implications for physi
 
 ## Closing
 Acacia is still a work-in-progress! Currently working on a new system to beat Hardcore (aka without dying once) with a fine-tuned System One model for enhanced reactivity, and getting random-seed beacon recreations of previous trials.
+
+## Regression tests
+
+Use Python 3.11+ with the notebook extra and Node 22.15+.
+
+```sh
+uv sync --extra notebook
+npm ci --prefix bridge
+PYTHONPATH=src:. uv run --no-sync python -m unittest discover -s tests
+npm --prefix bridge test
+```
+
+With Docker, Java 21+, Google Chrome, and access to Mojang's server download, run the live smoke test. It pulls the pinned server and bot images when needed.
+
+```sh
+MINECRAFT_LIVE_SMOKE=1 PYTHONPATH=src:. uv run --no-sync python -m unittest discover -s tests -p test_control_contract.py -v
+```
+
+The smoke test starts a temporary loopback world and runs the real daemon, Pi worker, Mineflayer bridge, and viewer. A scripted model stands in for the remote ChatGPT account and model calls.

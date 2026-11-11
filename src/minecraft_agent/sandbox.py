@@ -7,7 +7,6 @@ import shutil
 import socket
 import subprocess
 import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,6 +94,7 @@ def _probe_docker(timeout: float) -> SandboxProbe:
     if inspected.returncode:
         return SandboxProbe(False, f"pinned Docker sandbox image is not installed: {image}", docker, "docker", image)
 
+    listener: socket.socket | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="mc-docker-probe-") as directory:
             base = Path(directory)
@@ -122,6 +122,8 @@ def _probe_docker(timeout: float) -> SandboxProbe:
             connection.close()
             listener.close()
     except (OSError, subprocess.SubprocessError) as exc:
+        if listener:
+            listener.close()
         return SandboxProbe(False, f"Docker sandbox probe failed: {type(exc).__name__}: {str(exc)[:180]}", docker, "docker", image)
     return SandboxProbe(True, "Docker worker passed read-only root, isolated network, workspace-only writes, capability socket, uid, and resource-limit checks", docker, "docker", image)
 
@@ -135,74 +137,3 @@ def probe(timeout: float = 5) -> SandboxProbe:
     if docker.available:
         return SandboxProbe(True, f"{docker.reason}; bubblewrap unavailable: {bubblewrap.reason}", docker.command, "docker", docker.image)
     return SandboxProbe(False, f"no enforceable sandbox; bubblewrap: {bubblewrap.reason}; Docker: {docker.reason}", docker.command, docker.backend, docker.image)
-
-
-def worker_command(code_file: str | Path, helpers_dir: str | Path, socket_path: str | Path, *, helper_filename: str, timeout_seconds: int) -> list[str]:
-    """Build a sandboxed Node command for the legacy capability worker."""
-    code_file = Path(code_file).resolve()
-    helpers_dir = Path(helpers_dir).resolve()
-    socket_path = Path(socket_path).resolve()
-    if not code_file.is_file() or not helpers_dir.is_dir() or not socket_path.exists():
-        raise RuntimeError("worker code, helper directory, and capability socket must exist")
-    if not 1 <= timeout_seconds <= 30:
-        raise ValueError("worker timeout must be between 1 and 30 seconds")
-    if "/" in helper_filename or helper_filename.startswith("."):
-        raise ValueError("helper filename must be a simple file name")
-    node = shutil.which("node")
-    if not node:
-        raise RuntimeError("Node.js is unavailable")
-    isolation = probe()
-    if isolation.available and isolation.backend == "docker" and isolation.image:
-        docker = shutil.which("docker")
-        if docker:
-            cidfile = socket_path.parent / f"worker-{uuid.uuid4().hex}.cid"
-            return [
-                docker, "run", "--rm", "--pull=never", "--cidfile", str(cidfile),
-                "--network=none", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev",
-                "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop=ALL", "--security-opt", "no-new-privileges",
-                "--pids-limit", "16", "--memory", "256m", "--cpus", "1",
-                "--volume", f"{code_file}:/worker.js:ro", "--volume", f"{helpers_dir}:/work:ro",
-                "--volume", f"{socket_path}:/run/capability.sock:ro", "--workdir", "/work",
-                "--env", "HOME=/tmp", "--env", "PATH=/usr/local/bin:/usr/bin:/bin",
-                "--env", "CAPABILITY_SOCKET=/run/capability.sock", "--env", "HELPER_DIRECTORY=/work",
-                "--entrypoint", "node", isolation.image, "/worker.js", str(timeout_seconds * 1000), helper_filename,
-            ]
-    if isolation.available and isolation.backend == "bwrap":
-        bwrap = shutil.which("bwrap")
-        prlimit = shutil.which("prlimit")
-        if bwrap and prlimit:
-            command = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--ro-bind", "/usr", "/usr"]
-            for source in ("/lib", "/lib64", "/bin"):
-                resolved = Path(source).resolve()
-                if resolved.exists(): command.extend(("--ro-bind", str(resolved), source))
-            command.extend(("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--ro-bind", str(code_file), "/worker.js", "--ro-bind", str(helpers_dir), "/work", "--ro-bind", str(socket_path), "/tmp/capability.sock", "--chdir", "/work", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "CAPABILITY_SOCKET", "/tmp/capability.sock", "--setenv", "HELPER_DIRECTORY", "/work", "--", node, "/worker.js", str(timeout_seconds * 1000), helper_filename))
-            return [prlimit, "--as=1024000000", f"--cpu={timeout_seconds + 5}", "--nproc=16", "--fsize=1000000", "--", *command]
-    # The plan explicitly allows a clearly reported direct fallback when isolation is unavailable.
-    return [node, str(code_file), str(timeout_seconds * 1000), helper_filename]
-
-
-def worker_execution_mode(command: list[str]) -> str:
-    if command and Path(command[0]).name == "docker":
-        return "docker_no_network_workspace_and_socket_only"
-    if any(Path(value).name == "bwrap" for value in command):
-        return "bubblewrap_no_network_private_mounts"
-    return "operator_authorized_unsandboxed_fallback"
-
-
-def stop_worker(command: list[str]) -> None:
-    try:
-        index = command.index("--cidfile")
-        cidfile = Path(command[index + 1])
-        container_id = cidfile.read_text(encoding="ascii").strip()
-        if container_id and (docker := shutil.which("docker")):
-            subprocess.run([docker, "kill", container_id], capture_output=True, timeout=5, check=False)
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return
-
-
-def cleanup_worker(command: list[str]) -> None:
-    try:
-        index = command.index("--cidfile")
-        Path(command[index + 1]).unlink(missing_ok=True)
-    except (ValueError, OSError):
-        pass

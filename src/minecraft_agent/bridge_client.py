@@ -128,7 +128,7 @@ class BridgeClient:
     def stop(self) -> None:
         if self.process.poll() is None:
             try:
-                self.request("stop", {})
+                self.request("stop", {}, request_timeout=5)
             except (OSError, RuntimeError, TimeoutError):
                 pass
             try:

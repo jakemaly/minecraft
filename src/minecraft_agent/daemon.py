@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -65,6 +66,70 @@ class ActiveRun:
     manifest: dict[str, Any] = field(default_factory=dict)
     thread: threading.Thread | None = None
     finalizing: bool = False
+    last_gameplay_action: dict[str, Any] | None = None
+    last_saved_checkpoint: dict[str, Any] | None = None
+
+
+def _gameplay_state(observation: dict[str, Any]) -> dict[str, Any]:
+    player = observation.get("player") or {}
+    return {
+        "dimension": (observation.get("world") or {}).get("dimension"),
+        "position": player.get("position"), "health": player.get("health"),
+        "yaw": player.get("yaw"), "pitch": player.get("pitch"), "on_ground": player.get("on_ground"),
+        "food": player.get("food"), "oxygen": player.get("oxygen"),
+        "equipment": player.get("equipment"),
+        "inventory": observation.get("inventory_summary"),
+        "nearby_entities": observation.get("nearby_entities") or [],
+        "nearby_blocks": observation.get("nearby_blocks") or [],
+    }
+
+
+def _state_sha256(state: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _gameplay_preconditions(state: dict[str, Any]) -> dict[str, Any]:
+    return {key: state[key] for key in ("dimension", "equipment")}
+
+
+def _has_gameplay_progress(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    if before["dimension"] != after["dimension"]:
+        return True
+    for key in ("health", "food", "oxygen"):
+        if isinstance(before[key], (int, float)) and isinstance(after[key], (int, float)) and after[key] > before[key]:
+            return True
+    old_inventory = before["inventory"] or {}
+    new_inventory = after["inventory"] or {}
+    if any(new_inventory.get(name, 0) > count for name, count in old_inventory.items()):
+        return True
+    if any(count > old_inventory.get(name, 0) for name, count in new_inventory.items()):
+        return True
+    old_equipment = before["equipment"] or {}
+    new_equipment = after["equipment"] or {}
+    if any(item and item != old_equipment.get(slot) for slot, item in new_equipment.items()):
+        return True
+    no_worse = all(
+        not isinstance(before[key], (int, float)) or not isinstance(after[key], (int, float)) or after[key] >= before[key]
+        for key in ("health", "food", "oxygen")
+    )
+    return no_worse and (
+        before["position"] != after["position"]
+        or before["nearby_blocks"] != after["nearby_blocks"]
+        or before["nearby_entities"] != after["nearby_entities"]
+    )
+
+
+def _gameplay_evidence(observation: dict[str, Any]) -> dict[str, Any]:
+    state = _gameplay_state(observation)
+    hazards = [
+        block for block in state["nearby_blocks"]
+        if any(marker in (block.get("name") or "") for marker in ("lava", "fire", "magma", "cactus", "berry", "powder_snow", "water"))
+    ][:12]
+    return {
+        "observed_at": observation.get("observed_at"),
+        **{key: state[key] for key in ("dimension", "position", "yaw", "pitch", "health", "food", "oxygen", "equipment", "inventory")},
+        "nearby_entities": state["nearby_entities"][:8], "nearby_hazards": hazards,
+    }
 
 
 class _ControlHandler(socketserver.StreamRequestHandler):
@@ -191,14 +256,21 @@ class RunDaemon:
     def agent_bridge_request(self, params: dict[str, Any]) -> dict[str, Any]:
         run_id = str(params.get("run_id", ""))
         bridge_method = str(params.get("method", ""))
-        if bridge_method not in {"observe", "verify_goal", "viewer_snapshot", "release_controls"}:
+        if bridge_method not in {"observe", "verify_goal", "release_controls"}:
             raise ValueError("unsupported agent bridge request")
         with self.lock:
             run = self.active
             if not run or run.run_id != run_id or not run.bridge:
                 raise RuntimeError("active Mineflayer bridge not found for this run")
         try:
-            return run.bridge.request(bridge_method, params.get("arguments") or {}, request_timeout=20)
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    return run.bridge.request(bridge_method, params.get("arguments") or {}, request_timeout=20)
+                except TimeoutError as exc:
+                    if "bridge is busy; bounded request was deferred" not in str(exc) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
         except Exception as exc:
             run.events.append("bridge_request_failed", {"method": bridge_method, "error": str(exc)[:300]})
             raise
@@ -215,7 +287,7 @@ class RunDaemon:
 
     def _write_service_state(self) -> None:
         path = self.runtime / "service-state.json"
-        temp = path.with_suffix(".tmp")
+        temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         value = {"schema_version": 1, "updated_at": datetime.now(timezone.utc).isoformat(), "previous_run": self.previous_run}
         temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temp, path)
@@ -272,6 +344,20 @@ class RunDaemon:
                 active_elapsed = run.active_seconds_at_pause
                 if run.running_since is not None:
                     active_elapsed += max(0, time.monotonic() - run.running_since)
+                recent_events = self._recent_events(run)
+                checkpoint = run.last_saved_checkpoint or next((
+                    event for event in reversed(recent_events)
+                    if event.get("type") == "run_paused" and (event.get("payload") or {}).get("saved")
+                ), None)
+                plan_path = run.run_directory / "agent-workspace" / "plan.md"
+                try:
+                    with plan_path.open(encoding="utf-8") as plan_file:
+                        plan = plan_file.read(8_001)
+                    if len(plan) > 8_000:
+                        plan = plan[:8_000]
+                        plan += "\n… plan truncated; edit plan.md to keep the live plan concise"
+                except OSError:
+                    plan = ""
                 run_status = {
                     "run_id": run.run_id, "world_id": run.world_id, "kind": run.kind,
                     "state": run.state, "phase": run.phase, "error": run.error,
@@ -285,8 +371,10 @@ class RunDaemon:
                     "observer_username": run.observer_username,
                     "containerized": run.containerized,
                     "docker_network": run.docker_network,
+                    "plan": plan,
+                    "last_saved_checkpoint": checkpoint,
                     "supervisor": run.supervisor.status(),
-                    "recent_events": self._recent_events(run),
+                    "recent_events": recent_events,
                     "export_path": str(self.runtime / "exports" / f"{run.run_id}.zip") if (self.runtime / "exports" / f"{run.run_id}.zip").exists() else None,
                 }
             else:
@@ -353,6 +441,8 @@ class RunDaemon:
             config = RunConfig.from_environment()
             config.validate()
             container_status = ensure_runtime_images()
+            if not container_status.get("available"):
+                raise RuntimeError(f"Docker runtime unavailable: {container_status.get('reason', 'pinned runtime is unavailable')}")
             run_id = "run-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
             world_id = "world-" + uuid.uuid4().hex[:12]
             run_dir = self.runtime / "runs" / run_id
@@ -375,12 +465,33 @@ class RunDaemon:
                 events=EventLog(run_dir / "events" / "events.jsonl", run_id, world_id),
                 supervisor=Supervisor(run_dir, run_id), model=selected_model,
             )
-            if container_status.get("available"):
-                try:
-                    run.docker_network = create_private_network(run_id)
-                    run.containerized = True
-                except Exception as exc:
-                    container_status = {**container_status, "available": False, "reason": str(exc)[:500]}
+            socket_path = run_dir / ".runtime" / "mineflayer.sock"
+            socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            workspace_root = run_dir / "agent-workspace"
+            workspace = Workspace(workspace_root, events=run.events, bridge_socket=socket_path, shared_skills=self.runtime / "skills-library")
+            if not workspace.sandbox.available:
+                raise RuntimeError(f"workspace sandbox unavailable: {workspace.sandbox.reason}")
+            workspace.initialize(
+                mineflayer_docs=self.repo_root / "bridge/node_modules/mineflayer/docs",
+                pathfinder_docs=self.repo_root / "bridge/node_modules/mineflayer-pathfinder/readme.md",
+            )
+            if goal == "dragon_kill":
+                workspace.execute("write", {"path": "plan.md", "content": (
+                    "# Goal: Beat the Ender Dragon\n\n"
+                    "## Milestones (adapt to this world; check only after server evidence)\n"
+                    "- [ ] Secure an Overworld spawn and recovery supplies\n"
+                    "- [ ] Prepare gear, food, and supplies for the Nether\n"
+                    "- [ ] Gather blaze rods and ender pearls\n"
+                    "- [ ] Locate the stronghold and prepare the portal\n"
+                    "- [ ] Enter the End prepared and defeat the Dragon\n"
+                    "- [ ] Verify the server's `minecraft:end/kill_dragon` advancement\n\n"
+                    "## Current step\nObserve the actual world and choose a safe first step.\n\n"
+                    "## Last verified progress\nNone yet.\n\n"
+                    "## Blockers and recovery\nNone recorded.\n"
+                )})
+            run.workspace = workspace
+            run.docker_network = create_private_network(run_id)
+            run.containerized = True
             with self.lock:
                 self.active = run
                 self._write_service_state()
@@ -398,7 +509,7 @@ class RunDaemon:
                     "containers": container_status,
                     "containerized": run.containerized,
                     "private_network": run.docker_network,
-                    "gameplay_program_boundary": "bot process, Mineflayer program runner, and workspace are in the same unprivileged container; only the vanilla-server private network is attached" if run.containerized else "Mineflayer program runner is a host process; Docker workspace shell isolation does not confine mc-run",
+                    "gameplay_program_boundary": "bot process, Mineflayer program runner, and workspace are in the same unprivileged container; only the vanilla-server private network is attached",
                 },
                 "limits": {"model_context_window": selected_model.get("context_window"), "model_output_limit": selected_model.get("max_output_tokens"), "artificial_context_cap": None},
             }
@@ -406,34 +517,25 @@ class RunDaemon:
             run.events.append("run_created", {"manifest": run.manifest})
             run.supervisor.transition(RunState.MODELS_READY)
             self._set_phase(run, "downloading_server")
-            from scripts.server import download_server, prepare_server, server_command
+            from scripts.server import download_server, prepare_server
             server_cache = self.runtime / "server-cache"
             jar = download_server(config.minecraft_version, server_cache)
             local_jar = server_dir / jar.name
             shutil.copy2(jar, local_jar)
-            prepare_server(server_dir, seed=seed, bind_address="0.0.0.0" if run.containerized else bind, port=25565 if run.containerized else server_port)
+            prepare_server(server_dir, seed=seed, bind_address="0.0.0.0", port=25565)
             run.manifest["game"]["server_jar_sha1"] = self._sha1(local_jar)
             self._write_manifest(run)
             memory_mb = int(os.getenv("MINECRAFT_SERVER_HEAP_MB", "4096"))
             server_argv = server_container_command(
-                run_id=run_id, network=run.docker_network or "", server_directory=server_dir,
+                run_id=run_id, network=run.docker_network, server_directory=server_dir,
                 memory_mb=memory_mb,
-            ) if run.containerized else server_command(local_jar, memory_mb=memory_mb)
+            )
             run.supervisor.start(
                 "minecraft-server", server_argv,
                 cwd=server_dir, env={"RUN_ID": run_id}, ready_pattern=r"Done \(.*\)! For help", timeout=240,
             )
             run.supervisor.transition(RunState.WORLD_READY)
             self._set_phase(run, "connecting_bot")
-            socket_path = run_dir / ".runtime" / "mineflayer.sock"
-            socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            workspace_root = run_dir / "agent-workspace"
-            workspace = Workspace(workspace_root, events=run.events, bridge_socket=socket_path, shared_skills=self.runtime / "skills-library")
-            workspace.initialize(
-                mineflayer_docs=self.repo_root / "bridge/node_modules/mineflayer/docs",
-                pathfinder_docs=self.repo_root / "bridge/node_modules/mineflayer-pathfinder/readme.md",
-            )
-            run.workspace = workspace
             bridge_env = {
                 "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(run_dir / ".runtime"),
                 "LANG": "C.UTF-8", "RUN_ID": run_id, "MINECRAFT_VERSION": config.minecraft_version,
@@ -442,15 +544,12 @@ class RunDaemon:
                 "MINECRAFT_VIEWER_HOST": bind, "MINECRAFT_VIEWER_PORT": str(viewer_port), "MINECRAFT_VIEWER_DISTANCE": "6",
             }
             bridge_env.pop("OPENAI_API_KEY", None)
-            if run.containerized:
-                bridge_command = bot_container_command(
-                    run_id=run_id, network=run.docker_network or "", repo_root=self.repo_root,
-                    run_directory=run_dir, workspace=workspace_root,
-                    minecraft_version=config.minecraft_version,
-                )
-                bridge_env = {"PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(run_dir / ".runtime"), "LANG": "C.UTF-8"}
-            else:
-                bridge_command = ["node", str(self.repo_root / "bridge/src/bot.js")]
+            bridge_command = bot_container_command(
+                run_id=run_id, network=run.docker_network, repo_root=self.repo_root,
+                run_directory=run_dir, workspace=workspace_root,
+                minecraft_version=config.minecraft_version,
+            )
+            bridge_env = {"PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(run_dir / ".runtime"), "LANG": "C.UTF-8"}
             bridge = BridgeClient(bridge_command, cwd=self.repo_root / "bridge", env=bridge_env, timeout=90)
             run.bridge = bridge
             observation = bridge.request("observe", {}, request_timeout=20)
@@ -565,7 +664,7 @@ class RunDaemon:
         if run.workspace:
             run.workspace.cancel_active()
         if run.bridge:
-            run.bridge.request("release_controls", {}, request_timeout=10)
+            self.agent_bridge_request({"run_id": run.run_id, "method": "release_controls"})
         run.supervisor.send_command("minecraft-server", "tick freeze")
         run.supervisor.send_command("minecraft-server", "save-all flush")
         self.pi.request("pause_run", {"run_id": run.run_id}, timeout=10)
@@ -577,7 +676,7 @@ class RunDaemon:
             run.phase = "paused"
             if run.supervisor.state == RunState.RUNNING:
                 run.supervisor.transition(RunState.PAUSED)
-            run.events.append("run_paused", {"frozen": True, "saved": True, "active_elapsed_seconds": round(run.active_seconds_at_pause, 2)})
+            run.last_saved_checkpoint = run.events.append("run_paused", {"frozen": True, "saved": True, "active_elapsed_seconds": round(run.active_seconds_at_pause, 2)})
             self._write_service_state()
         return {"status": "paused", "world_frozen": True, "saved": True}
 
@@ -585,12 +684,11 @@ class RunDaemon:
         run = self.active
         if not run or run.state != "paused":
             raise RuntimeError("there is no paused world to resume")
-        run.supervisor.send_command("minecraft-server", "tick unfreeze")
-        if run.supervisor.state == RunState.PAUSED:
-            run.supervisor.transition(RunState.RUNNING)
         try:
             self.pi.request("resume_run", {"run_id": run.run_id}, timeout=10)
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not str(exc).endswith("active Pi run not found"):
+                raise
             remaining = max(0.0, run.duration_hours * 3600 - run.active_seconds_at_pause)
             self.pi.request("start_run", {
                 "run_id": run.run_id, "kind": run.kind, "goal": run.goal, "objective": run.objective,
@@ -598,6 +696,9 @@ class RunDaemon:
                 "bridge_socket": str(run.run_directory / ".runtime/mineflayer.sock"), "viewer_url": run.viewer_url,
                 "duration_seconds": remaining, "model_id": run.model.get("id"),
             }, timeout=30)
+        run.supervisor.send_command("minecraft-server", "tick unfreeze")
+        if run.supervisor.state == RunState.PAUSED:
+            run.supervisor.transition(RunState.RUNNING)
         with self.lock:
             run.state = "running"
             run.phase = "agent_running"
@@ -620,7 +721,10 @@ class RunDaemon:
             if run.bridge:
                 try:
                     run.bridge.request("release_controls", {}, request_timeout=5)
-                    run.bridge.request("stop", {}, request_timeout=5)
+                except Exception:
+                    pass
+                try:
+                    run.bridge.stop()
                 except Exception:
                     pass
             try:
@@ -660,7 +764,10 @@ class RunDaemon:
             if run.bridge:
                 try:
                     run.bridge.request("release_controls", {}, request_timeout=3)
-                    run.bridge.request("stop", {}, request_timeout=3)
+                except Exception:
+                    pass
+                try:
+                    run.bridge.stop()
                 except Exception:
                     pass
             run.supervisor.stop_minecraft_server(grace_seconds=15)
@@ -717,7 +824,90 @@ class RunDaemon:
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
-        return run.workspace.execute(name, arguments)
+        gameplay = None
+        command = []
+        if name == "bash":
+            try:
+                command = shlex.split(str(arguments.get("command", "")))
+            except ValueError:
+                command = []
+            if command and Path(command[0]).name == "mc-run" and len(command) > 1:
+                gameplay = self._begin_gameplay_action(run, command)
+        result = run.workspace.execute(name, arguments)
+        if name == "bash":
+            try:
+                response = json.loads(result.get("stdout", ""))
+                if not isinstance(response, dict):
+                    response = {}
+            except (ValueError, TypeError):
+                response = {}
+            timed_out = result.get("status") == "timeout" or response.get("status") == "timeout"
+            if command and Path(command[0]).name == "mc-run" and timed_out:
+                self._fail_timed_out_program(run, response)
+            if gameplay:
+                after = None
+                if not timed_out:
+                    try:
+                        after = run.bridge.request("observe", {}, request_timeout=20)
+                    except Exception as exc:
+                        run.events.append("gameplay_action_observation_failed", {"script": gameplay["script"], "error": str(exc)[:300]})
+                after_state = _gameplay_state(after) if after else None
+                state_progress = _has_gameplay_progress(gameplay["state"], after_state) if after_state is not None else None
+                run.last_gameplay_action = {"signature": gameplay["signature"], "state_progress": state_progress}
+                run.events.append("gameplay_action", {
+                    "script": gameplay["script"], "script_sha256": gameplay["script_sha256"],
+                    "state_before_sha256": gameplay["state_sha256"],
+                    "state_after_sha256": _state_sha256(after_state) if after_state is not None else None,
+                    "state_before": gameplay["evidence"],
+                    "state_after": _gameplay_evidence(after) if after else None,
+                    "state_progress": state_progress,
+                    "progress_basis": "observable state heuristic, not milestone verification",
+                    "action_signature": gameplay["signature"],
+                    "preconditions_sha256": gameplay["preconditions_sha256"],
+                    "status": response.get("status") or result.get("status") or ("completed" if result.get("exit_code") == 0 else "failed"),
+                })
+        return result
+
+    @staticmethod
+    def _begin_gameplay_action(run: ActiveRun, command: list[str]) -> dict[str, Any] | None:
+        # shortcut: only direct mc-run commands are tracked, broaden if compound shell calls become supported.
+        if not run.workspace or not run.bridge:
+            raise RuntimeError("cannot check gameplay action without the live workspace and bot")
+        try:
+            script_path = run.workspace._resolve(command[1])
+            if not script_path.is_file():
+                return None
+            with script_path.open("rb") as script_file:
+                script_sha256 = hashlib.file_digest(script_file, "sha256").hexdigest()
+            before = run.bridge.request("observe", {}, request_timeout=20)
+        except Exception as exc:
+            raise RuntimeError(f"cannot check gameplay action before running it: {str(exc)[:250]}") from exc
+        state = _gameplay_state(before)
+        state_sha256 = _state_sha256(state)
+        preconditions_sha256 = _state_sha256(_gameplay_preconditions(state))
+        signature = hashlib.sha256(f"{script_sha256}:{preconditions_sha256}".encode()).hexdigest()
+        previous = run.last_gameplay_action
+        if previous and previous.get("signature") == signature and previous.get("state_progress") is False:
+            run.events.append("gameplay_action_blocked", {"script": command[1], "script_sha256": script_sha256, "state_sha256": state_sha256})
+            raise RuntimeError("repeated gameplay action blocked: no observable state progress; change the script or relevant prerequisites before retrying")
+        return {
+            "script": command[1], "script_sha256": script_sha256, "state_sha256": state_sha256,
+            "signature": signature, "preconditions_sha256": preconditions_sha256,
+            "state": state, "evidence": _gameplay_evidence(before),
+        }
+
+    def _fail_timed_out_program(self, run: ActiveRun, response: dict[str, Any]) -> None:
+        with self.lock:
+            if run.finalizing:
+                return
+            run.finalizing = True
+            run.running_since = None
+            run.state = "failed"
+            run.phase = "failed"
+            run.error = f"Minecraft program timed out: {response.get('script') or 'workspace script'}"
+            run.events.append("gameplay_program_timeout", {"script": response.get("script"), "program_id": response.get("program_id")})
+            self._write_service_state()
+        threading.Thread(target=self._stop_run, args=(run,), kwargs={"final_state": "failed"}, name=f"timeout-cleanup-{run.run_id}", daemon=True).start()
 
     def agent_event(self, params: dict[str, Any]) -> dict[str, Any]:
         run = self.active
@@ -804,7 +994,8 @@ class RunDaemon:
                     if file.is_file() and not file.is_symlink():
                         archive.write(file, (Path(root_name) / relative).as_posix())
         os.replace(temp, target)
-        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        with target.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
         if run:
             run.events.append("evidence_exported", {"path": str(target), "sha256": digest, "bytes": target.stat().st_size})
         return {"path": str(target), "sha256": digest, "bytes": target.stat().st_size}
