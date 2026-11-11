@@ -1,6 +1,6 @@
 # Acacia: Self-Improving Minecraft Agent
 Acacia empowers large language models (LLMs) to embody a stateful player in digital environment, and to take actions within it.
-To public knowledge, Acacia is the **world's first agent to beat Minecraft on Hard mode.** 
+To public knowledge, Acacia is the **world's first agent to beat Minecraft on Hard mode** for a random seed and no human-authored templates.
 
 ## Intro
 <img width="1332" height="852" alt="image" src="https://github.com/user-attachments/assets/a1fa1594-3d81-4fe1-8e75-560a4f1c3c1e" />
@@ -20,9 +20,7 @@ Acacia is still a work-in-progress! Currently working on a new system to beat Ha
 
 ## Run the app
 
-Run the app on a Linux host with Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22+, npm, Java 21+, and Docker. Open the dashboard in a browser on any device that can reach the host. The included launcher uses Tailscale to provide private network access.
-
-For the standard setup, connect the host and browser device to Tailscale. From the repository root, install the app and bridge dependencies, then start the notebook:
+Run the app on a Linux host with Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22+, npm, Java 21+, and Docker. Open the dashboard in a browser on any device that can reach the host. From the repository root, install the app and bridge dependencies, then start the notebook:
 
 ```sh
 uv sync --extra notebook
@@ -30,4 +28,4 @@ npm ci --prefix bridge
 ./scripts/run_notebook.sh
 ```
 
-Open `http://<server-address>:2718` from your browser. With the included launcher, use the host's Tailscale IP; it detects the address automatically. Press `Ctrl+C` in the terminal to stop the app.
+Open `http://<server-address>:2718` from your browser.
