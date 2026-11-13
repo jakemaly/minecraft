@@ -101,7 +101,8 @@ export async function play({ directory, socket, agentDir, signal, record, infere
     await session.prompt(prompt);
     const last = session.messages.findLast(message => message.role === 'assistant');
     if (last?.errorMessage) throw new Error(last.errorMessage);
-    return 'Pi ended its session before the server recorded a dragon kill.';
+    if (last?.stopReason === 'stop') return 'The model returned a final answer before the server recorded a dragon kill.';
+    return `Pi stopped (${last?.stopReason ?? 'no model reply'}) before the server recorded a dragon kill.`;
   } finally {
     signal.removeEventListener('abort', stop);
     session?.dispose();

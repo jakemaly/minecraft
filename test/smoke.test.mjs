@@ -121,12 +121,15 @@ test('Pi settles a real Mine AI action and an early victory claim leaves the att
       run = await status();
     }
     assert.equal(run.state, 'incomplete');
-    assert.equal(run.detail, 'Pi ended its session before the server recorded a dragon kill.');
+    assert.equal(run.detail, 'The model returned a final answer before the server recorded a dragon kill.');
     assert.ok(run.activity.some(event => event.type === 'tool_execution_end' && event.tool === 'mcp__minecraft__wait_for_action' && event.outcome === 'settled'));
     const directory = join(root, run.id);
     await stat(join(directory, 'server/world/level.dat'));
     assert.ok((await readdir(directory)).some(name => name.endsWith('.jsonl') && name !== 'activity.jsonl'));
-    assert.match(await readFile(join(directory, 'server.log'), 'utf8'), /All dimensions are saved/);
+    const serverLog = await readFile(join(directory, 'server.log'), 'utf8');
+    assert.match(serverLog, /Acacia joined the game/);
+    assert.match(serverLog, /Set Acacia's game mode to Survival Mode/);
+    assert.match(serverLog, /All dimensions are saved/);
   } finally {
     await app.close();
     if (process.env.MINECRAFT_KEEP_SMOKE === '1') console.log(root);

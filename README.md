@@ -1,6 +1,6 @@
 # Mine AI Minecraft
 
-Pi plays a fresh Minecraft 1.21.4 Survival world on seed `97996358`. [Mine AI MCP](https://github.com/aibengineering/mine-ai-mcp/tree/de4fef3260424d973bf81d0eaa15ff1a2f73ecff) owns the bot, actions, and survival reflexes. The dashboard starts and stops one run, shows tool activity, and embeds the bot’s first-person view. The Minecraft client can join as spectator.
+Pi plays a fresh Minecraft 1.21.4 Survival world on seed `97996358`. [Mine AI MCP](https://github.com/aibengineering/mine-ai-mcp/tree/de4fef3260424d973bf81d0eaa15ff1a2f73ecff) owns the bot Acacia, actions, and survival reflexes. The dashboard starts and stops one run, shows tool activity, and embeds the bot’s first-person view. The Minecraft client can join as spectator.
 
 Pi uses GPT-6.1 Terra at medium reasoning through ChatGPT sign-in. The prompt comes from the [published run manifest](https://huggingface.co/datasets/aibengineering/beat-the-game-minecraft/blob/de4bfb91972d263e592276c3a33a8b49d3e75d81/run.json) (CC BY 4.0, aibengineering). The original win used Claude Opus 5 in Claude Code. Each attempt begins from an empty world. Success requires the server to record the bot’s `minecraft:end/kill_dragon` advancement.
 

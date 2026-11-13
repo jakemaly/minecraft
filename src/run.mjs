@@ -15,7 +15,7 @@ const serverImage = 'eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817b
 const mineImage = 'minecraft-mine-ai:de4fef3';
 const revision = 'de4fef3260424d973bf81d0eaa15ff1a2f73ecff';
 const jarHash = '4707d00eb834b446575d89a61a11b5d548d8c001';
-const bot = 'AI_M1KE';
+const bot = 'Acacia';
 const seed = '97996358';
 const advancement = 'minecraft:end/kill_dragon';
 const owner = root => `minecraft-mine-ai=${root}`;
@@ -29,7 +29,10 @@ export async function recoverRuns(root) {
 }
 
 export function dragonAdvancement(log) {
-  return log.match(/^\[\d\d:\d\d:\d\d\] \[Server thread\/INFO\]: AI_M1KE has made the advancement \[Free the End\]\r?$/m)?.[0].trimEnd() ?? null;
+  return log.match(new RegExp(
+    String.raw`^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: ${RegExp.escape(bot)} has made the advancement \[Free the End\]?$`,
+    'm',
+  ))?.[0].trimEnd() ?? null;
 }
 
 async function verifiedJar(root, path) {
@@ -177,7 +180,7 @@ export function startRun(config) {
       await waitFor(() => ready, serverExit);
       ({ done: mineExit } = launch('mine-ai', [
         ...common, '--name', mineName, '--memory', '2g', '--cpus', '2', '--pids-limit', '128',
-        '-v', `${data}:/data:rw`, '-v', `${sockets}:/sockets:rw`, '-e', 'HOME=/data', image.Id,
+        '-v', `${data}:/data:rw`, '-v', `${sockets}:/sockets:rw`, '-e', 'HOME=/data', '-e', `MINECRAFT_BOT=${bot}`, image.Id,
       ]));
       const mcp = join(directory, 'mcp.sock');
       await waitFor(() => pinSocket('mcp'), mineExit);
@@ -185,7 +188,7 @@ export function startRun(config) {
       const health = async () => {
         const response = await fetch('http://127.0.0.1:25575/health', { dispatcher, signal: AbortSignal.timeout(2000) });
         const status = await response.json();
-        if (!status.ok || !status.minecraft?.connected || status.minecraft.gamemode !== 'survival') return false;
+        if (!status.ok || !status.minecraft?.connected || status.minecraft.username !== bot || status.minecraft.gamemode !== 'survival') return false;
         const { health, food, inventory } = status.minecraft;
         run.player = { health, food, inventory };
         return true;

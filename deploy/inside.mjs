@@ -1,6 +1,9 @@
 import { createConnection, createServer } from 'node:net';
 import { chmod, rm } from 'node:fs/promises';
 
+const username = process.env.MINECRAFT_BOT;
+if (!username) throw new Error('MINECRAFT_BOT is required.');
+
 for (const [name, host, port] of [
   ['mcp', '127.0.0.1', 25575],
   ['viewer', '127.0.0.1', 3000],
@@ -21,7 +24,7 @@ for (const [name, host, port] of [
 }
 const host = Bun.spawn([
   'bun', 'src/server/host.ts', '--minecraft-host', 'minecraft', '--minecraft-port', '25565',
-  '--username', 'AI_M1KE', '--version', '1.21.4', '--data-root', '/data',
+  '--username', username, '--version', '1.21.4', '--data-root', '/data',
 ], { stdout: 'inherit', stderr: 'inherit' });
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => host.kill(signal));
 process.exit(await host.exited);
