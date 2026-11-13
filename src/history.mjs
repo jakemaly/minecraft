@@ -1,5 +1,6 @@
 import { open, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { readReflection } from './primitives.mjs';
 
 export const runId = /^[a-f0-9]{12}$/;
 const sessionFile = /^\d{4}-\d\d-\d\dT[\d-Z]+_[a-f0-9-]+\.jsonl$/i;
@@ -10,13 +11,18 @@ export async function savedRuns(root) {
     const directory = join(root, name);
     try {
       const manifest = join(directory, 'run.json');
-      const { seed, model, thinkingLevel } = JSON.parse(await readFile(manifest, 'utf8'));
+      const { seed, model, thinkingLevel, hardcore, profile, parent } = JSON.parse(await readFile(manifest, 'utf8'));
       const date = (await stat(manifest)).mtime.toISOString();
       const result = await readFile(join(directory, 'result.json'), 'utf8').then(JSON.parse, error => {
         if (error.code !== 'ENOENT') throw error;
-        return { state: 'incomplete', detail: 'The service stopped before recording an outcome.' };
+        return { state: 'incomplete', interrupted: true, detail: 'The service stopped before recording an outcome.' };
       });
-      return { id: name, date, seed, model, thinkingLevel, state: result.state, detail: result.detail, player: result.player };
+      const reflection = result.state === 'dead' || result.interrupted ? await readReflection(directory).catch(error => {
+        if (!(error instanceof SyntaxError)) throw error;
+        return { error: 'The saved death review is unreadable.' };
+      }) : undefined;
+      return { id: name, date, seed, model, thinkingLevel, hardcore, profile, parent, reflection,
+        death: result.death, interrupted: result.interrupted, state: result.state, detail: result.detail, player: result.player };
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }

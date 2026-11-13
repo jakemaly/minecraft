@@ -88,7 +88,7 @@ async function sparePort() {
   return port;
 }
 
-export async function smokeDashboard(root, viewerPort, gamePort, scenario = 'continue') {
+export async function smokeDashboard(root, viewerPort, gamePort, scenario = 'continue', options = {}) {
   const agentDir = join(root, 'pi');
   await mkdir(agentDir);
   // This fixture exercises Pi’s real session and tool execution with a scripted provider stream.
@@ -98,17 +98,17 @@ export async function smokeDashboard(root, viewerPort, gamePort, scenario = 'con
   return dashboard({
     host, port: 0, root, viewerPort, gamePort, allowed: new Set([host]), agentDir,
     jar: process.env.MINECRAFT_SERVER_JAR,
-    inference: agentDir => scriptedInference(agentDir, scenario),
+    inference: agentDir => scriptedInference(agentDir, scenario), ...options,
   });
 }
 
 const smokeOptions = { skip: process.env.MINECRAFT_SMOKE !== '1', timeout: 140_000 };
 
-async function attempt(scenario, verify) {
+async function attempt(scenario, verify, options) {
   const root = await mkdtemp(join(tmpdir(), 'mine-ai-'));
   const viewerPort = await sparePort();
   const gamePort = await sparePort();
-  const app = await smokeDashboard(root, viewerPort, gamePort, scenario);
+  const app = await smokeDashboard(root, viewerPort, gamePort, scenario, options);
   const status = async () => (await fetch(`http://${host}:${app.port}/api/run`)).json();
   const waitFor = async condition => {
     for (let n = 0; n < 180; n++) {
@@ -128,7 +128,7 @@ async function attempt(scenario, verify) {
     const directory = join(root, run.id);
     const consoleCommand = command => execFileSync('docker', ['exec', `mineai-${run.id}-server`,
       'sh', '-c', 'printf "%s\n" "$1" > /proc/1/fd/0', 'sh', command], { timeout: 5000 });
-    await verify({ run, app, gamePort, directory, waitFor, terminal, consoleCommand });
+    await verify({ run, app, gamePort, directory, root, status, waitFor, terminal, consoleCommand });
     await stat(join(directory, 'server/world/level.dat'));
     assert.ok((await readdir(directory)).some(name => name.endsWith('.jsonl') && name !== 'activity.jsonl'));
     const serverLog = await readFile(join(directory, 'server.log'), 'utf8');
@@ -202,6 +202,46 @@ test('death and a temporary game-mode change keep the run live until an actual d
     assert.equal(final.state, 'incomplete');
     assert.match(final.detail, /Mine AI lost its Minecraft connection/);
   }));
+
+test('Hardcore death saves a review and launches one fresh world on the same settings', smokeOptions, async () => {
+  const reviewed = [];
+  await attempt('disconnect', async ({ run, directory, root, app, waitFor, consoleCommand }) => {
+    await waitFor(state => state.activity.some(event => event.type === 'continuation'));
+    consoleCommand('kill Acacia');
+    const successor = await waitFor(state => state.id !== run.id && state.state === 'running');
+    assert.equal(reviewed.length, 1);
+    assert.match(reviewed[0].cause, /Acacia/);
+    assert.equal(successor.parent, run.id);
+    assert.deepEqual(successor.profile, run.profile);
+    const reflection = JSON.parse(await readFile(join(directory, 'reflection.json'), 'utf8'));
+    assert.equal(reflection.category, 'environment');
+    assert.equal(reflection.summary, 'The test operator issued a kill command.');
+    assert.equal(reflection.profile, undefined);
+    assert.equal(reflection.stopped, undefined);
+    const history = await (await fetch(`http://${host}:${app.port}/api/runs`)).json();
+    assert.deepEqual(history.find(saved => saved.id === run.id).reflection, reflection);
+    const result = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
+    assert.equal(result.state, 'dead');
+    const properties = await readFile(join(root, successor.id, 'server/server.properties'), 'utf8');
+    assert.match(properties, /^hardcore=true$/m);
+    assert.match(properties, /^difficulty=hard$/m);
+    const environment = execFileSync('docker', ['inspect', '--format', '{{json .Config.Env}}',
+      `mineai-${successor.id}-bot`], { encoding: 'utf8' });
+    const policy = JSON.parse(JSON.parse(environment).find(value => value.startsWith('MINE_AI_BASE_POLICY=')).split('=')[1]);
+    assert.equal(policy.combat.critical_health, run.profile.criticalHealth);
+    assert.equal(policy.navigation.hostile_avoidance_multiplier, run.profile.hostileAvoidance);
+  }, {
+    hardcore: true,
+    reflect: async ({ death }) => {
+      reviewed.push(death);
+      return {
+        category: 'environment', summary: 'The test operator issued a kill command.',
+        evidence: [death.cause], uncertainty: '', reviewQuestion: '',
+        profile: { criticalHealth: 14, hostileAvoidance: 3 }, stopped: true,
+      };
+    },
+  });
+});
 
 test('an expired MCP session reconnects without restarting Pi or Minecraft', smokeOptions, () =>
   attempt('expired', async ({ directory, waitFor, terminal }) => {

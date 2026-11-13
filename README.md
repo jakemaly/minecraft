@@ -11,7 +11,7 @@ Use Linux, Node 24.15+, and Docker Engine 28+ with isolated bridge support. Acce
 ```sh
 npm ci
 docker pull eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817bbceb6b3be94109b4a784d46078099882dda
-docker build -f deploy/Dockerfile -t minecraft-mine-ai:de4fef3-search-budget .
+docker build -f deploy/Dockerfile -t minecraft-mine-ai:de4fef3-primitives .
 npm start
 ```
 
@@ -21,12 +21,18 @@ For the user service, install the app at `~/.local/opt/minecraft-mine-ai` and in
 
 Each attempt writes its manifest, Pi JSONL session, activity, server log and world, and Mine AI SQLite data under `~/.local/share/mine-ai`. A new run always gets a new directory. If the model ends early, Pi prompts it again in the same session. Three follow-ups without a newly completed action end the attempt as incomplete. Pi reconnects expired MCP sessions in place. Terminal provider errors and operator stops end the attempt.
 
+## Hardcore
+
+Set `MINECRAFT_HARDCORE=1` before launching the dashboard or in the service environment file, then start an attempt. Hardcore uses Java Hard difficulty and ends the attempt on a server death. A separate model call reviews recent game evidence and saves a short diagnosis, evidence, uncertainty, and a question for the maintainer. Open the finished attempt under **Runs** to read its death review, or read `reflection.json` in the run directory. The dashboard starts a fresh world on the same seed with the baseline settings, even if the review fails. The next run records its settings and the previous run ID in `run.json`. Reviews are available to the maintainer and stay outside the gameplay context.
+
+The dashboard owns death retries. The overseer still handles infrastructure interruptions. Use the dashboard Stop control to end the loop. A verified Dragon kill ends the loop automatically.
+
 ## Verify
 
-Run `npm run check` and `npm test`. After building the image, run `MINECRAFT_SMOKE=1 node --test test/smoke.test.mjs` for the Docker and Pi integration test.
+Run `npm run check` and `npm test`. After building the image, run `MINECRAFT_SMOKE=1 node --test test/smoke.test.mjs` for the Docker and Pi integration tests, including a forced Hardcore death and fresh-world restart.
 
 ## Overseer
 
-The user-level `minecraft-overseer.timer` checks the dashboard and run directories every 15 seconds. A terminal attempt or a run directory abandoned by a stopped harness wakes the configured Codex chat. The overseer restarts after a verified fix or recovery and reports deliberate operator stops without restarting. A vanilla-server `Free the End` advancement for the bot takes priority and ends the overseer after it reports the result. The watcher saves its progress in `overseer.json` beside the runs.
+The user-level `minecraft-overseer.timer` checks the dashboard and run directories every 15 seconds. A terminal attempt or a run directory abandoned by a stopped harness can wake the configured Codex chat. The overseer reports bugs for human review and can restart after a verified external recovery. A vanilla-server `Free the End` advancement for the bot takes priority and ends the overseer after it reports the result. The watcher saves its progress in `overseer.json` beside the runs.
 
 Install `deploy/minecraft-overseer.{service,timer}` under `~/.config/systemd/user`. Set `MINECRAFT_OVERSEER_REPO` and `MINECRAFT_OVERSEER_THREAD` in `~/.config/minecraft-overseer.env` to the worktree and existing Codex chat ID. Use `node src/overseer.mjs arm` with the same runtime directory as the dashboard to begin watching subsequent attempts. Enable the timer with `systemctl --user enable --now minecraft-overseer.timer`. To suspend automatic follow-up, stop the timer. The watcher's decisions are visible in `journalctl --user -u minecraft-overseer.service`.

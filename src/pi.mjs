@@ -32,7 +32,7 @@ export async function openai(agentDir) {
   return { runtime, model };
 }
 
-export async function play({ directory, socket, agentDir, signal, record, inference = openai }) {
+export async function play({ directory, socket, agentDir, signal, record, prompt: promptFile = new URL('../deploy/prompt.txt', import.meta.url), actionWaitMs, inference = openai }) {
   const { runtime, model } = await inference(agentDir);
   const dispatcher = new Agent({ connect: { socketPath: socket } });
   let client;
@@ -63,6 +63,10 @@ export async function play({ directory, socket, agentDir, signal, record, infere
       description: tool.description,
       parameters: tool.inputSchema,
       async execute(_id, args, toolSignal) {
+        // The async action keeps its owner and checkpoint after a wait expires.
+        // Bound how long Pi goes without a chance to reconsider the action.
+        const waitKey = tool.name === 'wait_for_action' ? 'timeout_ms' : 'wait_timeout_ms';
+        if (actionWaitMs && args[waitKey] > actionWaitMs) args = { ...args, [waitKey]: actionWaitMs };
         let result;
         try {
           result = await client.callTool(tool.name, args, { signal: toolSignal });
@@ -129,7 +133,7 @@ export async function play({ directory, socket, agentDir, signal, record, infere
     });
     signal.addEventListener('abort', stop, { once: true });
     signal.throwIfAborted();
-    let prompt = await readFile(new URL('../deploy/prompt.txt', import.meta.url), 'utf8');
+    let prompt = await readFile(promptFile, 'utf8');
     for (;;) {
       signal.throwIfAborted();
       lastReply = undefined;

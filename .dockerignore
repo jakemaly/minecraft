@@ -6,3 +6,4 @@
 !deploy/view-blocks.patch
 !deploy/build-progress.patch
 !deploy/search-budget.patch
+!deploy/primitives.patch

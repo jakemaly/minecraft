@@ -4,26 +4,73 @@ import { createServer as createSocket } from 'node:net';
 import { mkdir, readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { recoverRuns, startRun } from './run.mjs';
+import { dragonAdvancement, recoverRuns, startRun } from './run.mjs';
 import { conversation, runId, savedRuns } from './history.mjs';
 import { modelId, thinkingLevel } from './pi.mjs';
+import { deathReview, readReflection, recordedDeath, reflectDeath, writeReflection } from './primitives.mjs';
 
-export async function dashboard({ host, port, root, agentDir, viewerPort, gamePort, allowed, jar, inference }) {
+export async function dashboard({ host, port, root, agentDir, viewerPort, gamePort, allowed, jar, inference, hardcore = false, reflect = reflectDeath }) {
   await mkdir(root, { recursive: true, mode: 0o700 });
-  const config = { host, root: await realpath(root), agentDir, viewerPort, gamePort, allowed, jar, inference };
+  const config = { host, root: await realpath(root), agentDir, viewerPort, gamePort, allowed, jar, inference, hardcore };
   const assets = new Map(await Promise.all([
     ['/', 'index.html', 'text/html; charset=utf-8'],
     ['/dashboard.mjs', 'dashboard.mjs', 'text/javascript; charset=utf-8'],
     ['/assets/dark-theme-enabled.svg', 'assets/dark-theme-enabled.svg', 'image/svg+xml'],
   ].map(async ([route, file, type]) => [route, { body: await readFile(new URL(`../web/${file}`, import.meta.url)), type }])));
   let run;
+  let review;
+  let closing = false;
   const status = () => run ? {
-    id: run.id, state: run.state, detail: run.detail, activity: run.activity ?? [], player: run.player,
+    id: run.id, state: run.state, detail: run.detail, hardcore: run.hardcore, profile: run.profile, parent: run.parent, death: run.death, activity: run.activity ?? [], player: run.player,
     model: modelId, thinkingLevel,
     viewer: run.state === 'running' ? run.viewer : null,
     spectator: run.state === 'running' ? run.spectator : null,
   } : { state: 'idle', activity: [], model: modelId, thinkingLevel };
-  const active = () => ['starting', 'running', 'saving'].includes(run?.state);
+  const active = () => Boolean(review) || ['starting', 'running', 'saving'].includes(run?.state);
+
+  function begin(parent) {
+    const started = startRun({ ...config, parent });
+    run = started;
+    started.done.then(() => {
+      if (started.state === 'dead' && started.hardcore && !closing) schedule(started);
+    }).catch(error => {
+      started.state = 'incomplete';
+      started.detail = error.message;
+      console.error(error);
+    });
+  }
+
+  function schedule(ended) {
+    const directory = join(config.root, ended.id);
+    const controller = new AbortController();
+    ended.state = 'reflecting';
+    review = {
+      controller,
+      done: (async () => {
+        let reflection = await readReflection(directory);
+        if (!reflection) {
+          const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]);
+          try {
+            reflection = deathReview(await reflect({ directory, death: ended.death, agentDir, signal, inference }));
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            reflection = { error: String(error?.message ?? error) };
+          }
+          if (controller.signal.aborted) return;
+          await writeReflection(directory, reflection);
+        }
+        if (controller.signal.aborted || closing || reflection.stopped) return;
+        // Saved reviews are human-readable records, including older files with a proposed profile.
+        begin(ended.id);
+      })().catch(error => {
+        ended.detail = `Reflection could not continue: ${error.message}`;
+        console.error(error);
+      }).finally(() => {
+        if (run === ended && ended.state === 'reflecting') ended.state = 'dead';
+        if (!review?.stop) review = undefined;
+      }),
+    };
+  }
 
   const server = createServer(async (request, response) => {
     const json = (statusCode, value) => {
@@ -68,18 +115,30 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
     }
     if (request.method === 'POST' && request.headers.origin === origin) {
       if (request.url === '/api/start') {
-        if (active()) return json(409, { error: 'A run is already active.' });
-        const started = startRun(config);
-        run = started;
-        started.done.catch(error => {
-          started.state = 'incomplete';
-          started.detail = error.message;
-          console.error(error);
-        });
+        if (closing || active()) return json(409, { error: 'A run is already active.' });
+        if (hardcore && run?.state === 'won') return json(409, { error: 'The Dragon has already been defeated.' });
+        begin();
         return json(202, status());
       }
       if (request.url === '/api/stop') {
-        if (active()) void run.stop().catch(() => {});
+        if (review) {
+          const ended = run;
+          const pending = review;
+          pending.controller.abort(new Error('Stopped by operator.'));
+          // Keep the lifecycle owned until the stop marker is durable.
+          pending.stop ??= pending.done.then(async () => {
+            const directory = join(config.root, ended.id);
+            await writeReflection(directory, { ...await readReflection(directory), stopped: true });
+            review = undefined;
+          });
+          await pending.stop.catch(error => {
+            ended.detail = `Could not record stop: ${error.message}`;
+            review = undefined;
+            console.error(error);
+          });
+        } else if (active()) {
+          void run.stop().catch(() => {});
+        }
         return json(202, status());
       }
     }
@@ -92,7 +151,33 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
   try {
     await recoverRuns(config.root);
     [run] = await savedRuns(config.root);
+    if (hardcore && run?.hardcore && run.state !== 'won') {
+      const directory = join(config.root, run.id);
+      // Recover a win written by vanilla before the launcher saved its result.
+      for (const file of ['server/logs/latest.log', 'server.log']) {
+        const log = await readFile(join(directory, file), 'utf8').catch(error => {
+          if (error.code !== 'ENOENT') throw error;
+          return '';
+        });
+        const proof = dragonAdvancement(log);
+        if (!proof) continue;
+        Object.assign(run, { state: 'won', detail: proof });
+        break;
+      }
+      if (run.state === 'incomplete' && run.interrupted) {
+        const death = await recordedDeath(directory).catch(error => {
+          console.error(`Could not recover death evidence for ${run.id}: ${error.message}`);
+          return null;
+        });
+        if (death) Object.assign(run, { state: 'dead', death, detail: death.cause ?? 'Minecraft recorded Acacia’s death.' });
+      }
+    }
+    const resumeReview = hardcore && run?.hardcore && run.state === 'dead' &&
+      !(await readReflection(join(config.root, run.id)))?.stopped;
     await new Promise((ready, reject) => server.once('error', reject).listen(port, host, ready));
+    if (resumeReview) {
+      schedule(run);
+    }
   } catch (error) {
     lock.close();
     throw error;
@@ -100,10 +185,14 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
   return {
     port: server.address().port,
     async close() {
+      closing = true;
       const closed = new Promise(ready => server.close(ready));
-      if (active()) await run.stop(new Error('Harness service shut down.')).catch(() => {});
+      if (review) {
+        review.controller.abort(new Error('Harness service shut down.'));
+        await (review.stop ?? review.done);
+      } else if (active()) await run.stop(new Error('Harness service shut down.')).catch(() => {});
       await closed;
-      lock.close();
+      await new Promise(ready => lock.close(ready));
     },
   };
 }
@@ -119,6 +208,7 @@ if (import.meta.main) {
     root: resolve(process.env.MINECRAFT_RUNS ?? join(homedir(), '.local/share/mine-ai')),
     agentDir: resolve(process.env.PI_AGENT_DIR ?? join(homedir(), '.local/share/minecraft-agent/pi')),
     jar: process.env.MINECRAFT_SERVER_JAR,
+    hardcore: process.env.MINECRAFT_HARDCORE === '1',
   });
   console.log(`Dashboard at http://${host}:${app.port}`);
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => { void app.close(); });

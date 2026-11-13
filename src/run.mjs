@@ -9,10 +9,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { Agent, fetch } from 'undici';
 import { play, modelId, thinkingLevel } from './pi.mjs';
+import { defaultPrimitives, minePolicy, recordedDeath } from './primitives.mjs';
 
 const docker = promisify(execFile).bind(null, 'docker');
 const serverImage = 'eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817bbceb6b3be94109b4a784d46078099882dda';
-const mineImage = 'minecraft-mine-ai:de4fef3-search-budget';
+const mineImage = 'minecraft-mine-ai:de4fef3-primitives';
 const revision = 'de4fef3260424d973bf81d0eaa15ff1a2f73ecff';
 const jarHash = '4707d00eb834b446575d89a61a11b5d548d8c001';
 const bot = 'Acacia';
@@ -84,6 +85,8 @@ function forward(host, port, path, allowed) {
 export function startRun(config) {
   const id = randomUUID().replaceAll('-', '').slice(0, 12);
   const directory = join(config.root, id);
+  const hardcore = config.hardcore === true;
+  const profile = defaultPrimitives;
   const sockets = join(directory, 'io');
   const serverName = `mineai-${id}-server`;
   const mineName = `mineai-${id}-bot`;
@@ -97,7 +100,7 @@ export function startRun(config) {
     abort.abort(failure);
   };
   const run = {
-    id, seed, state: 'starting', activity: [], detail: null,
+    id, seed, hardcore, profile, parent: config.parent, state: 'starting', activity: [], detail: null,
     viewer: `http://${config.host}:${config.viewerPort}/`, spectator: `${config.host}:${config.gamePort}`,
     stop(reason = operatorStop) {
       if (!signal.aborted) abort.abort(reason);
@@ -129,30 +132,34 @@ export function startRun(config) {
     let server, serverExit, mineExit, agent, networkCreated, hasManifest, proof, stopped = false;
     let ready = false;
     let savedWorld = false;
-    let finishWin;
-    const won = new Promise(resolve => { finishWin = resolve; });
+    let death;
+    let finish;
+    const terminal = new Promise(resolve => { finish = resolve; });
+    const prompt = new URL(hardcore ? '../deploy/hardcore.txt' : '../deploy/prompt.txt', import.meta.url);
     try {
       await mkdir(directory, { mode: 0o700 });
       await Promise.all([world, data, sockets].map(path => mkdir(path, { mode: 0o700 })));
       if (Buffer.byteLength(join(sockets, 'viewer.sock')) >= 108) throw new Error('Run directory is too long for Unix sockets.');
-      await writeFile(join(directory, 'run.json.tmp'), JSON.stringify({
-        id, seed, bot, version: '1.21.4', jarHash, revision, model: modelId, thinkingLevel,
-        promptSha256: createHash('sha256').update(await readFile(new URL('../deploy/prompt.txt', import.meta.url))).digest('hex'),
-      }, null, 2));
-      await rename(join(directory, 'run.json.tmp'), join(directory, 'run.json'));
-      hasManifest = true;
-      signal.throwIfAborted();
       const inspected = await docker(['image', 'inspect', mineImage], { timeout: 10_000 });
       const [image] = JSON.parse(inspected.stdout);
       if (image.Config.Labels?.['org.opencontainers.image.revision'] !== revision) {
         throw new Error('The Mine AI image does not match the pinned source revision.');
       }
+      await writeFile(join(directory, 'run.json.tmp'), JSON.stringify({
+        id, seed, bot, version: '1.21.4', jarHash, revision, model: modelId, thinkingLevel,
+        hardcore, profile, parent: config.parent,
+        image: image.Id, promptSha256: createHash('sha256').update(await readFile(prompt)).digest('hex'),
+      }, null, 2));
+      await rename(join(directory, 'run.json.tmp'), join(directory, 'run.json'));
+      hasManifest = true;
+      signal.throwIfAborted();
       const jar = config.jar ?? join(config.root, 'server.jar');
       await verifiedJar(config.root, jar, signal);
       signal.throwIfAborted();
       await writeFile(join(world, 'eula.txt'), 'eula=true\n');
       await writeFile(join(world, 'server.properties'), [
-        'online-mode=false', 'gamemode=spectator', 'force-gamemode=true', 'difficulty=normal', 'hardcore=false',
+        'online-mode=false', 'gamemode=spectator', 'force-gamemode=true',
+        `difficulty=${hardcore ? 'hard' : 'normal'}`, `hardcore=${hardcore}`,
         `level-seed=${seed}`, 'view-distance=10', 'simulation-distance=10', 'spawn-protection=0',
         'enable-rcon=false', 'enable-command-block=false', '',
       ].join('\n'));
@@ -181,14 +188,15 @@ export function startRun(config) {
         if (evidence && !proof) {
           proof = evidence;
           record('advancement', { advancement, evidence });
-          finishWin(evidence);
+          finish(evidence);
           abort.abort();
         }
       }));
       await waitFor(() => ready, serverExit);
       ({ done: mineExit } = launch('mine-ai', [
         ...common, '--name', mineName, '--memory', '2g', '--cpus', '2', '--pids-limit', '128',
-        '-v', `${data}:/data:rw`, '-v', `${sockets}:/sockets:rw`, '-e', 'HOME=/data', '-e', `MINECRAFT_BOT=${bot}`, image.Id,
+        '-v', `${data}:/data:rw`, '-v', `${sockets}:/sockets:rw`, '-e', 'HOME=/data', '-e', `MINECRAFT_BOT=${bot}`,
+        '-e', `MINE_AI_BASE_POLICY=${JSON.stringify(minePolicy(profile))}`, image.Id,
       ]));
       const mcp = join(directory, 'mcp.sock');
       await waitFor(() => pinSocket('mcp'), mineExit);
@@ -198,6 +206,12 @@ export function startRun(config) {
           dispatcher, signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
         });
         const status = await response.json();
+        if (status.minecraft?.username === bot && hardcore && status.minecraft.lastDeath && !death) {
+          death = status.minecraft.lastDeath;
+          record('death', { death });
+          finish(death.cause);
+          abort.abort();
+        }
         if (!status.ok || !status.minecraft?.connected || status.minecraft.username !== bot) return null;
         const { health, food, inventory, gamemode } = status.minecraft;
         run.player = { health, food, inventory };
@@ -210,17 +224,17 @@ export function startRun(config) {
         forwards.push(await forward(config.host, config.gamePort, join(directory, 'game.sock'), config.allowed));
         signal.throwIfAborted();
         run.state = 'running';
-        agent = play({ directory, socket: mcp, agentDir: config.agentDir, signal, record, inference: config.inference });
+        agent = play({ directory, socket: mcp, agentDir: config.agentDir, signal, record, prompt, actionWaitMs: hardcore ? profile.actionWaitMs : undefined, inference: config.inference });
         const watchdog = async () => {
           let failures = 0;
-          while (!signal.aborted && !proof) {
-            await delay(3000, undefined, { signal });
+          while (!signal.aborted) {
+            await delay(hardcore ? 1000 : 3000, undefined, { signal });
             failures = await health().catch(() => false) ? 0 : failures + 1;
-            if (failures >= 4) throw new Error('Mine AI lost its Minecraft connection.');
+            if (failures >= (hardcore ? 12 : 4)) throw new Error('Mine AI lost its Minecraft connection.');
           }
           return null;
         };
-        run.detail = await Promise.race([agent, won, watchdog(), exited(serverExit), exited(mineExit)]);
+        run.detail = await Promise.race([agent, terminal, watchdog(), exited(serverExit), exited(mineExit)]);
       } finally {
         await dispatcher.destroy();
       }
@@ -228,6 +242,7 @@ export function startRun(config) {
       stopped = signal.reason === operatorStop;
       if (!stopped && !proof) error ??= signal.reason?.message ?? failure.message;
     } finally {
+      stopped ||= signal.reason === operatorStop;
       run.state = 'saving';
       abort.abort();
       forwards.forEach(close => close());
@@ -248,15 +263,25 @@ export function startRun(config) {
       if (hasManifest) {
         for (const name of ['mcp', 'viewer', 'game']) await rm(join(directory, `${name}.sock`), { force: true });
       }
-      const state = proof ? 'won' : stopped && !error ? 'stopped' : 'incomplete';
-      const detail = proof ? [proof, error].filter(Boolean).join(' · ') : error ?? run.detail ?? 'Stopped by operator.';
+      // Death and a disconnect can arrive in the same tick. The bot's durable
+      // server event still identifies the outcome after the containers stop.
+      if (hardcore && hasManifest && !proof && !death) {
+        try {
+          death = await recordedDeath(directory);
+        } catch (failure) {
+          error ??= `Could not read death evidence: ${failure.message}`;
+        }
+      }
+      const state = proof ? 'won' : stopped ? 'stopped' : death ? 'dead' : 'incomplete';
+      const detail = proof ?? (state === 'dead' ? death.cause ?? 'Minecraft recorded Acacia’s death.'
+        : stopped ? operatorStop.message : error ?? run.detail ?? 'Attempt ended before a verified outcome.');
       if (hasManifest) {
         await writeFile(join(directory, 'result.json.tmp'), JSON.stringify({
-          state, detail, player: run.player, cleanupError: proof ? error : undefined,
+          state, detail, death, player: run.player, cleanupError: state !== 'incomplete' ? error : undefined,
         }, null, 2));
         await rename(join(directory, 'result.json.tmp'), join(directory, 'result.json'));
       }
-      Object.assign(run, { state, detail });
+      Object.assign(run, { state, detail, death });
     }
 
     function launch(name, args, onLine) {

@@ -14,6 +14,14 @@ let signature = '';
 let controlPending = false;
 let revision = 0;
 
+const reviewCategory = {
+  decision: 'Gameplay decision',
+  implementation_bug: 'Suspected implementation bug',
+  capability_gap: 'Missing capability',
+  environment: 'Game circumstances',
+  uncertain: 'Uncertain',
+};
+
 async function api(path, options) {
   const response = await fetch(path, options);
   const body = await response.json();
@@ -98,7 +106,7 @@ function renderInventory(items) {
 }
 
 function renderStatus() {
-  const active = ['starting', 'running', 'saving'].includes(run.state);
+  const active = ['starting', 'running', 'saving', 'reflecting'].includes(run.state);
   $('start').disabled = !run.state || active || controlPending;
   $('stop').hidden = !active;
   $('stop').disabled = run.state === 'saving' || controlPending;
@@ -120,6 +128,7 @@ function renderStatus() {
     }
   } else {
     const text = run.state === 'starting' ? 'Starting the Minecraft world…'
+      : run.state === 'reflecting' ? 'Reviewing the Hardcore death…'
       : run.id ? 'Run finished. Its transcript is available in Conversation and Runs.'
       : 'Start a run to open the live first-person world view.';
     if (viewer.textContent !== text) viewer.innerHTML = `<div class="viewer-empty">${text}</div>`;
@@ -260,7 +269,7 @@ async function showRuns() {
       const button = document.createElement('button');
       button.className = 'run-library-item';
       button.innerHTML = `<span class="run-library-title"><span>Beat the Ender Dragon</span><span>${esc(title(saved.state))}</span></span>
-        <span class="run-library-meta">${esc(new Date(saved.date).toLocaleString())} · Seed ${esc(saved.seed)}</span>`;
+        <span class="run-library-meta">${esc(new Date(saved.date).toLocaleString())} · Seed ${esc(saved.seed)}${saved.reflection?.summary || saved.reflection?.cause ? ' · Death review' : ''}</span>`;
       button.onclick = () => showRun(saved);
       return button;
     }));
@@ -275,11 +284,20 @@ async function showRun(saved) {
   $('run-detail-view').hidden = false;
   $('run-detail-title').textContent = saved.id;
   const panel = $('run-detail-content');
+  const review = saved.reflection;
+  const reviewMarkup = review?.summary || review?.cause || review?.error ? `<section class="run-library-event" aria-label="Death review">
+    <h3>Death review</h3>
+    ${reviewCategory[review.category] ? `<p class="run-library-meta">${esc(reviewCategory[review.category])}</p>` : ''}
+    <p class="trace-text">${esc(review.summary ?? review.cause ?? review.error)}</p>
+    ${Array.isArray(review.evidence) && review.evidence.length ? `<ul>${review.evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : ''}
+    ${review.uncertainty ? `<p class="trace-text"><strong>Uncertainty</strong> ${esc(review.uncertainty)}</p>` : ''}
+    ${review.reviewQuestion ? `<p class="trace-text"><strong>Question for review</strong> ${esc(review.reviewQuestion)}</p>` : ''}
+    </section>` : '';
   panel.innerHTML = `<h2 class="run-detail-heading">Beat the Ender Dragon</h2>
     <dl class="run-detail-facts"><dt>Status</dt><dd>${esc(title(saved.state))}</dd>
       <dt>Seed</dt><dd>${esc(saved.seed)}</dd><dt>Model</dt><dd>${esc(saved.model)}</dd>
       <dt>Reasoning</dt><dd>${esc(title(saved.thinkingLevel))}</dd></dl>
-    <p class="run-library-meta">${esc(saved.detail)}</p><button id="saved-more" class="load-more" hidden>Load older activity</button>
+    <p class="run-library-meta">${esc(saved.detail)}</p>${reviewMarkup}<button id="saved-more" class="load-more" hidden>Load older activity</button>
     <div id="saved-messages" class="run-detail-timeline"></div>`;
   const entries = [];
   async function load(cursor) {
