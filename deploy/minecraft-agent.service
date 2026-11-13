@@ -1,0 +1,16 @@
+[Unit]
+Description=Minecraft Mine AI dashboard
+After=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/opt/minecraft-mine-ai
+ExecStart=/usr/bin/node src/server.mjs
+EnvironmentFile=%h/.config/minecraft-mine-ai.env
+Restart=on-failure
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=default.target

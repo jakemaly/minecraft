@@ -1,38 +1,26 @@
-# Acacia: Self-Improving Minecraft Agent
-Acacia empowers large language models (LLMs) to embody a stateful player in digital environment, and to take actions within it.
-To public knowledge, Acacia is the **world's first agent to beat Minecraft on Hard mode.** 
+# Mine AI Minecraft
 
-## Intro
-<img width="1332" height="852" alt="image" src="https://github.com/user-attachments/assets/a1fa1594-3d81-4fe1-8e75-560a4f1c3c1e" />
+Pi plays a fresh Minecraft 1.21.4 Survival world on seed `97996358`. [Mine AI MCP](https://github.com/aibengineering/mine-ai-mcp/tree/de4fef3260424d973bf81d0eaa15ff1a2f73ecff) owns the bot, actions, and survival reflexes. The dashboard starts and stops one run, shows tool activity, and embeds the bot’s first-person view. The Minecraft client can join as spectator.
 
-## What is Acacia?
-Acacia is a self-improving model harness and agent system  - it uses a fork of [Pi](https://pi.dev), a minimal agent harness giving models the ability to read, write, and run files. With this capability, it can drive AXI tools and create scripts using the [Mineflayer API](https://github.com/prismarinejs/mineflayer), a Minecraft bot library that allows the agent to control the player in space. 
+Pi uses GPT-6.1 Terra at medium reasoning through ChatGPT sign-in. The prompt comes from the [published run manifest](https://huggingface.co/datasets/aibengineering/beat-the-game-minecraft/blob/de4bfb91972d263e592276c3a33a8b49d3e75d81/run.json) (CC BY 4.0, aibengineering). The original win used Claude Opus 5 in Claude Code. Each attempt begins from an empty world. Success requires the server to record the bot’s `minecraft:end/kill_dragon` advancement.
 
-Inspired by Nous Research's Hermes Agent and Voyager, Acacia learns by continuously programming itself new Skills and Mineflayer scripts, enriching its capabilities as time goes on. Upon death, the model creates a reflection on why it died and saves new Skills to its Library. Additionally, model deaths and their environments are turned into negative rewards for reinforcement learning (RL), allowing us to train more risk-adverse agents. On simulated environments, RL-trained models choose risk-aware alternatives 43% more often compared to untrained counterparts.
+## Run locally
 
-<img width="677" height="679" alt="image" src="https://github.com/user-attachments/assets/f41a589b-2e1f-4b56-9871-9bd1d22835e8" />
-
-## So what?
-Acacia represents a fundamental shift in AI systems, with implications for physical intelligence, robotics, and recursive self-improvement. Traditional long-horizon agent tasks like those found in Software Engineering have a static environment - if you don't change anything, nothing happens. In Minecraft, the world is constantly changing around you, and no two environments will ever be the same. Acacia shows that dynamic environments demand continuous learning and adaptation that persist past training cutoffs, especially for Transformer-based models (LLMs, VLAs, etc). 
-
-## Closing
-Acacia is still a work-in-progress! Currently working on a new system to beat Hardcore (aka without dying once) with a fine-tuned System One model for enhanced reactivity, and getting random-seed beacon recreations of previous trials.
-
-## Regression tests
-
-Use Python 3.11+ with the notebook extra and Node 22.15+.
+Use Linux, Node 24.15+, and Docker Engine 28+ with isolated bridge support. Accept the [Minecraft EULA](https://aka.ms/MinecraftEULA) before launching.
 
 ```sh
-uv sync --extra notebook
-npm ci --prefix bridge
-PYTHONPATH=src:. uv run --no-sync python -m unittest discover -s tests
-npm --prefix bridge test
+npm ci
+docker pull eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817bbceb6b3be94109b4a784d46078099882dda
+docker build -f deploy/Dockerfile -t minecraft-mine-ai:de4fef3 .
+npm start
 ```
 
-With Docker, Java 21+, Google Chrome, and access to Mojang's server download, run the live smoke test. It pulls the pinned server and bot images when needed.
+Open http://127.0.0.1:2718. The default Pi credential directory is `~/.local/share/minecraft-agent/pi`. To sign in or refresh an expired login, run `PI_CODING_AGENT_DIR="$HOME/.local/share/minecraft-agent/pi" npx --no-install pi` and use `/login` to sign in with ChatGPT. Exit Pi before starting a run. The first run downloads and verifies Mojang’s server JAR. To use an existing verified copy, set `MINECRAFT_SERVER_JAR` to its absolute path.
 
-```sh
-MINECRAFT_LIVE_SMOKE=1 PYTHONPATH=src:. uv run --no-sync python -m unittest discover -s tests -p test_control_contract.py -v
-```
+For the user service, install the app at `~/.local/opt/minecraft-mine-ai` and install `deploy/minecraft-agent.service` in `~/.config/systemd/user`. Set `MINECRAFT_HOST` and `MINECRAFT_CLIENT_TAILSCALE_IP` in `~/.config/minecraft-mine-ai.env` to the server and operator addresses, respectively. The default ports are 2718 for the dashboard, 3000 for the viewer, and 25565 for Minecraft. Keep the corresponding tailnet grants. MCP crosses the sandbox on a private Unix socket. Docker runs the game and bot with an isolated bridge, read-only roots, dropped capabilities, resource limits, and per-run writable mounts.
 
-The smoke test starts a temporary loopback world and runs the real daemon, Pi worker, Mineflayer bridge, and viewer. A scripted model stands in for the remote ChatGPT account and model calls.
+Each attempt writes its manifest, Pi JSONL session, activity, server log and world, and Mine AI SQLite data under `~/.local/share/mine-ai`. A new run always gets a new directory. An early final model answer or terminal provider error ends the attempt.
+
+## Verify
+
+Run `npm run check` and `npm test`. After building the image, run `MINECRAFT_SMOKE=1 node --test test/smoke.test.mjs` for the Docker and Pi integration test.

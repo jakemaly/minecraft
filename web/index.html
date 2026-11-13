@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minecraft · Mine AI</title>
+<style>
+  :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #161b16; color: #edf1e8; }
+  body { max-width: 74rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
+  h1 { margin: 0; font-size: clamp(1.8rem, 5vw, 3rem); }
+  h2 { font-size: 1rem; }
+  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+  p { margin: .55rem 0; }
+  .muted { color: #bdc8b8; }
+  button { border: 1px solid #657762; border-radius: .4rem; padding: .6rem .9rem; font: inherit; background: #242e24; color: inherit; cursor: pointer; }
+  button:first-child { background: #c8eba6; border-color: #c8eba6; color: #18220f; }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+  main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(15rem, 1fr); gap: 1rem; margin-top: 1.5rem; }
+  section { min-width: 0; border: 1px solid #39463a; border-radius: .6rem; background: #1c231c; padding: 1rem; }
+  section h2 { margin-top: 0; }
+  #view { aspect-ratio: 16 / 9; background: #111710; display: grid; place-items: center; }
+  iframe { width: 100%; height: 100%; border: 0; }
+  ol { margin: 0; padding: 0; list-style: none; max-height: 30rem; overflow: auto; }
+  li { padding: .45rem 0; border-bottom: 1px solid #39463a; overflow-wrap: anywhere; }
+  time { display: block; font-size: .8rem; }
+  #error { color: #ffc6bb; }
+  @media (max-width: 48rem) { main { grid-template-columns: 1fr; } }
+</style>
+<header>
+  <div>
+    <h1>Mine AI</h1>
+    <p class="muted">Minecraft 1.21.4 · Survival · Seed 97996358</p>
+    <p id="state" role="status">Connecting…</p>
+    <p id="detail"></p>
+    <p id="error" role="alert"></p>
+  </div>
+  <div><button id="start" disabled>Start fresh run</button> <button id="stop" disabled>Stop and save</button></div>
+</header>
+<main>
+  <section aria-labelledby="world-title">
+    <h2 id="world-title">First-person view</h2>
+    <div id="view"><span class="muted">The viewer opens when the bot joins.</span></div>
+    <p id="spectator" class="muted" hidden></p>
+  </section>
+  <section aria-labelledby="activity-title">
+    <h2 id="activity-title">Live activity</h2>
+    <ol id="activity"></ol>
+  </section>
+</main>
+<script type="module">
+  const byId = id => document.getElementById(id);
+  const view = byId('view');
+  const start = byId('start');
+  const stop = byId('stop');
+  let pending = false;
+  let renderedActivity = '';
+  let revision = 0;
+  let status = { state: 'connecting' };
+
+  function controls() {
+    start.disabled = pending || ['connecting', 'starting', 'running', 'saving'].includes(status.state);
+    stop.disabled = pending || !['starting', 'running'].includes(status.state);
+  }
+
+  function render(run) {
+    status = run;
+    const label = run.state === 'won' ? 'Dragon defeated' : run.state[0].toUpperCase() + run.state.slice(1);
+    if (byId('state').textContent !== label) byId('state').textContent = label;
+    byId('detail').textContent = run.detail ?? '';
+    controls();
+    if ((run.viewer ?? '') !== (view.dataset.url ?? '')) {
+      view.dataset.url = run.viewer ?? '';
+      if (run.viewer) {
+        const frame = document.createElement('iframe');
+        frame.title = 'Live first-person Minecraft view';
+        frame.src = run.viewer;
+        frame.allowFullscreen = true;
+        view.replaceChildren(frame);
+      } else {
+        view.textContent = 'The viewer opens when the bot joins.';
+      }
+    }
+    byId('spectator').hidden = !run.spectator;
+    byId('spectator').textContent = run.spectator ? `Join as spectator in Minecraft at ${run.spectator}` : '';
+    const activity = JSON.stringify(run.activity);
+    if (activity === renderedActivity) return;
+    renderedActivity = activity;
+    byId('activity').replaceChildren(...run.activity.toReversed().map(event => {
+      const item = document.createElement('li');
+      const time = document.createElement('time');
+      time.dateTime = event.time;
+      time.className = 'muted';
+      time.textContent = new Date(event.time).toLocaleTimeString();
+      const tool = event.tool?.replace('mcp__minecraft__', '').replaceAll('_', ' ');
+      const label = ({
+        tool_execution_start: `Started ${tool}`, tool_execution_end: `${event.isError ? 'Error in' : 'Returned from'} ${tool}${event.outcome ? ` · ${event.outcome}` : ''}`,
+        assistant: event.errorMessage || `Model response · ${event.model}`,
+        advancement: 'Free the End', spectator: `${event.name} joined as spectator`,
+      })[event.type] ?? event.type;
+      item.append(time, label);
+      return item;
+    }));
+  }
+
+  async function request(path, method = 'GET') {
+    const response = await fetch(path, { method });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    return data;
+  }
+
+  async function change(action) {
+    pending = true;
+    revision++;
+    controls();
+    try {
+      render(await request(`/api/${action}`, 'POST'));
+      byId('error').textContent = '';
+    } catch (error) {
+      byId('error').textContent = error.message;
+    } finally {
+      pending = false;
+      controls();
+    }
+  }
+
+  start.addEventListener('click', () => change('start'));
+  stop.addEventListener('click', () => change('stop'));
+  async function refresh() {
+    if (!pending) {
+      const requestedRevision = revision;
+      try {
+        const run = await request('/api/run');
+        if (!pending && revision === requestedRevision) render(run);
+      } catch (error) {
+        byId('error').textContent = error.message;
+      }
+    }
+    setTimeout(refresh, 1000);
+  }
+  refresh();
+</script>
+</html>

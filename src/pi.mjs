@@ -1,0 +1,111 @@
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { McpClient, StreamableHttpTransport, toLlmContent } from '@earendil-works/pi-mcp';
+import { Agent, fetch } from 'undici';
+
+export const modelId = 'gpt-6.1-terra';
+export const thinkingLevel = 'medium';
+
+export async function openai(agentDir) {
+  const runtime = await ModelRuntime.create({
+    authPath: join(agentDir, 'auth.json'),
+    modelsPath: fileURLToPath(new URL('../deploy/models.json', import.meta.url)), refreshOnCreate: false,
+  });
+  const credential = (await runtime.listCredentials()).find(item => item.providerId === 'openai');
+  if (credential?.type !== 'oauth') throw new Error('Sign in to Pi with ChatGPT OAuth before starting a run.');
+  const model = runtime.getModel('openai', modelId);
+  if (model?.api !== 'openai-responses') throw new Error(`Pi does not support ${modelId} through OpenAI Responses.`);
+  const getAuth = runtime.getAuth.bind(runtime);
+  runtime.getAuth = async (target, options) => {
+    const resolution = await getAuth(target, options);
+    if (resolution?.source !== 'OAuth') throw new Error('Pi requires ChatGPT OAuth for every request.');
+    return resolution;
+  };
+  const stream = runtime.streamSimple.bind(runtime);
+  runtime.streamSimple = (target, context, options) => stream(target, context, {
+    ...options, timeoutMs: Math.max(options?.timeoutMs ?? 0, 30 * 60_000),
+  });
+  return { runtime, model };
+}
+
+export async function play({ directory, socket, agentDir, signal, record, inference = openai }) {
+  const { runtime, model } = await inference(agentDir);
+  const dispatcher = new Agent({ connect: { socketPath: socket } });
+  const client = new McpClient({ name: 'Pi Minecraft', version: '1.0.0', requestTimeoutMs: 180_000 });
+  const transport = new StreamableHttpTransport({
+    url: 'http://127.0.0.1:25575/mcp',
+    fetch: (url, options) => fetch(url, { ...options, dispatcher }),
+  });
+  let session;
+  const stop = () => { void session.abort(); };
+  try {
+    signal.throwIfAborted();
+    await client.connect(transport);
+    const catalogue = await client.listTools();
+    if (catalogue.length !== 37 || catalogue.some(tool => tool.name.startsWith('debug_'))) {
+      throw new Error('Mine AI did not expose the 37 standard tools.');
+    }
+    const tools = catalogue.map(tool => ({
+      name: `mcp__minecraft__${tool.name}`,
+      label: tool.name,
+      description: tool.description,
+      parameters: tool.inputSchema,
+      async execute(_id, args, toolSignal) {
+        const result = await client.callTool(tool.name, args, { signal: toolSignal });
+        const { _meta, ...details } = result;
+        const content = toLlmContent(result);
+        if (result.content.length && result.structuredContent?.response?.format === 'json') {
+          content.push({ type: 'text', text: JSON.stringify(result.structuredContent) });
+        }
+        return { content, details, isError: result.isError };
+      },
+    }));
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, cacheWarming: 'off' });
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: directory, agentDir, settingsManager, noExtensions: true, noSkills: true,
+      noContextFiles: true, noPromptTemplates: true, noThemes: true, appendSystemPrompt: [], systemPrompt: client.instructions,
+    });
+    await resourceLoader.reload();
+    ({ session } = await createAgentSession({
+      cwd: directory, agentDir, model, modelRuntime: runtime, thinkingLevel, settingsManager, resourceLoader,
+      sessionManager: SessionManager.create(directory, directory),
+      customTools: tools, noTools: 'all', tools: tools.map(tool => tool.name),
+    }));
+    // A wait and its successor must reach Mine AI in the order Pi emitted them.
+    session.agent.toolExecution = 'sequential';
+    if (session.getActiveToolNames().sort().join() !== tools.map(tool => tool.name).sort().join()) {
+      throw new Error('Pi did not activate the exact Mine AI tool catalogue.');
+    }
+    record('catalogue', { tools: catalogue, model: model.id, contextWindow: model.contextWindow });
+    session.subscribe(event => {
+      if (event.type === 'tool_execution_start' || event.type === 'tool_execution_end') {
+        const response = event.result?.details?.structuredContent?.response;
+        const markdown = response?.markdown ?? '';
+        const actionId = response?.data?.actionId ?? markdown.match(/^Action ID: ([a-f0-9-]+)$/m)?.[1];
+        const outcome = response?.data?.state ?? (markdown.startsWith('**Accepted:**') ? 'accepted'
+          : markdown.startsWith('## Action in progress') ? 'pending'
+          : actionId ? 'settled' : undefined);
+        record(event.type, { id: event.toolCallId, tool: event.toolName, isError: event.isError, actionId, outcome });
+      }
+      if (event.type === 'message_end' && event.message.role === 'assistant') {
+        const { model, usage, stopReason, errorMessage } = event.message;
+        record('assistant', { model, usage, stopReason, errorMessage });
+      }
+    });
+    signal.addEventListener('abort', stop, { once: true });
+    signal.throwIfAborted();
+    const prompt = await readFile(new URL('../deploy/prompt.txt', import.meta.url), 'utf8');
+    signal.throwIfAborted();
+    await session.prompt(prompt);
+    const last = session.messages.findLast(message => message.role === 'assistant');
+    if (last?.errorMessage) throw new Error(last.errorMessage);
+    return 'Pi ended its session before the server recorded a dragon kill.';
+  } finally {
+    signal.removeEventListener('abort', stop);
+    session?.dispose();
+    await client.close().catch(() => {});
+    await dispatcher.destroy();
+  }
+}
