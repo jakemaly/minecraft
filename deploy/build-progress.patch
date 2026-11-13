@@ -1,0 +1,70 @@
+diff --git a/src/navigation/processes/building/build-process.test.ts b/src/navigation/processes/building/build-process.test.ts
+index 8f8cbc4..8fb1fa5 100644
+--- a/src/navigation/processes/building/build-process.test.ts
++++ b/src/navigation/processes/building/build-process.test.ts
+@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
+ import test from "node:test";
+ import { Vec3 } from "vec3";
+ import { packKey } from "../../index.js";
++import { breakBlockInPlace } from "../../execution/in-place-break.js";
+ import { structureWorld } from "../../../test-support/structure-world.js";
+ import { build, enclosesBot, type BuildCell, type BuildRequest, type BuildResult } from "./build-process.js";
+-import { observation } from "../../../test-support/navigation.js";
++import { FakeNavigationBot, flatWorld, observation } from "../../../test-support/navigation.js";
+
+ const goalTestWorld = new GoalTestWorld();
+
+@@ -254,6 +255,31 @@ test("a cell asked to be air is dug clear without being asked to remove wrong bl
+   assert.equal(bot.blockAt(new Vec3(2, 64, 0))!.name, "air");
+ });
+
++test("a dig that leaves the active portal in place is refused and the rest of the build proceeds", async () => {
++  const { bot, put, physics } = structureWorld();
++  const portal = new Vec3(2, 64, 0);
++  put(portal, "nether_portal");
++  const world = flatWorld();
++  world.load(portal, { stateId: bot.registry.blocksByName.nether_portal!.defaultState,
++    traits: { empty: true, safeToBreak: false } });
++  const digger = new FakeNavigationBot();
++  digger.startEffect = () => { throw new Error("cannot dig the active portal"); };
++  let attempts = 0;
++  const result = await build(bot, {
++    ...physics,
++    cells: [...cells([[2, 64, 0]], "air"), ...cells([[3, 64, 0]])],
++    removeWrongBlocks: false,
++    breakInPlace: async (options) => {
++      assert.equal(++attempts, 1, "the unchanged portal must not be dug again");
++      return breakBlockInPlace({ world, bot: digger }, options);
++    },
++  });
++  assert.deepEqual(kinds(result), ["refused", "correct"]);
++  assert.equal(result.dug, 0);
++  assert.equal(result.placed, 1);
++  assert.equal(bot.blockAt(portal)?.name, "nether_portal");
++});
++
+ test("a route that cannot reach a cell refuses that cell and carries on with the rest", async () => {
+   const { bot, physics, placements } = structureWorld();
+   let stopped = false;
+diff --git a/src/navigation/processes/building/build-process.ts b/src/navigation/processes/building/build-process.ts
+index d6c4620..3c09028 100644
+--- a/src/navigation/processes/building/build-process.ts
++++ b/src/navigation/processes/building/build-process.ts
+@@ -438,9 +438,15 @@ async function workInReach(
+     if (!target) return worked;
+     const state = targeting.stateOf(target);
+     if (state.kind === "diggable") {
++      const position = asVec3(target.position);
++      const before = bot.blockAt(position);
+       const dug = await request.breakInPlace({ movements, position: target.position, signal });
+-      if (dug.status === "broken") targeting.dug += 1;
+-      else targeting.refuse(target, dug.reason);
++      const after = bot.blockAt(position);
++      // A collision-free block such as a lit portal can produce an empty excavation.
++      if (dug.status === "failed") targeting.refuse(target, dug.reason);
++      else if (!before || !after || (after.name === before.name && after.stateId === before.stateId)) {
++        targeting.refuse(target, "No block change was observed after digging.");
++      } else targeting.dug += 1;
+     } else if (state.kind === "placeable") {
+       const item = bot.inventory.items().find((candidate) => candidate.name === target.blockName)!;
+       const placed = await request.place({

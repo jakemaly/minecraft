@@ -12,7 +12,7 @@ import { play, modelId, thinkingLevel } from './pi.mjs';
 
 const docker = promisify(execFile).bind(null, 'docker');
 const serverImage = 'eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817bbceb6b3be94109b4a784d46078099882dda';
-const mineImage = 'minecraft-mine-ai:de4fef3-block-scan';
+const mineImage = 'minecraft-mine-ai:de4fef3-build-progress';
 const revision = 'de4fef3260424d973bf81d0eaa15ff1a2f73ecff';
 const jarHash = '4707d00eb834b446575d89a61a11b5d548d8c001';
 const bot = 'Acacia';
