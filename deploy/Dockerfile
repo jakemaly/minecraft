@@ -8,7 +8,7 @@ RUN cd /opt/viewer && cp viewer-package.json package.json && cp viewer-package-l
     && sed -i '/chunkColumnLoad: function (pos)/i\      chunkColumnUnload: function (pos) { worldView.unloadChunk(pos) },' node_modules/prismarine-viewer/viewer/lib/worldView.js
 COPY deploy/viewer.mjs /opt/viewer/viewer.mjs
 COPY deploy/inside.mjs /opt/mine-ai/inside.mjs
-COPY deploy/viewer.patch /tmp/viewer.patch
-RUN git apply /tmp/viewer.patch
+COPY deploy/viewer.patch deploy/view-blocks.patch /tmp/
+RUN git apply /tmp/viewer.patch /tmp/view-blocks.patch
 LABEL org.opencontainers.image.revision="${MINE_AI_COMMIT}"
 ENTRYPOINT ["bun", "/opt/mine-ai/inside.mjs"]

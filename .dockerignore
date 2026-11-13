@@ -3,3 +3,4 @@
 !deploy/Dockerfile
 !deploy/inside.mjs
 !deploy/viewer*
+!deploy/view-blocks.patch

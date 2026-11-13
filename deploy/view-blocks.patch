@@ -1,0 +1,143 @@
+diff --git a/src/actions/view-blocks/view-blocks.test.ts b/src/actions/view-blocks/view-blocks.test.ts
+index 4681010..b46415c 100644
+--- a/src/actions/view-blocks/view-blocks.test.ts
++++ b/src/actions/view-blocks/view-blocks.test.ts
+@@ -89,6 +89,33 @@ test("a name Minecraft has no block for fails the view rather than finding nothi
+   assert.match((result as { error: string }).error, /no block named unobtainium/);
+ });
+
++test("dense Nether block counts stay below the runtime heartbeat deadline", () => {
++  const netherrack = registry.blocksByName.netherrack!;
++  const uniform = { solidBlockCount: 4096, data: { value: netherrack.defaultState }, get: () => netherrack.defaultState };
++  const mixed = {
++    solidBlockCount: 1, data: {}, palette: [0, netherrack.defaultState],
++    get: ({ x, y, z }: Vec3) => x === 0 && y === 0 && z === 0 ? netherrack.defaultState : 0,
++  };
++  const column = { minY: 0, sections: [...Array(8).fill(uniform), mixed] };
++  const columns = Array.from({ length: 441 }, (_, index) => ({
++    chunkX: Math.floor(index / 21) - 28, chunkZ: index % 21 - 27, column,
++  }));
++  const bot = botFixture({ position: new Vec3(-290, 44, -266) }, {
++    world: { getColumns: () => columns },
++    blockAt: (position: Vec3) => ({ name: netherrack.name, position, boundingBox: netherrack.boundingBox }),
++  });
++  const request = parseViewBlocksRequest({ find: { block_names: ["netherrack"], limit: 3 } });
++  const start = performance.now();
++  const result = viewBlocks(bot, request);
++  const elapsed = performance.now() - start;
++  assert.ok(elapsed < 5000, `view_blocks blocked the event loop for ${elapsed.toFixed(0)} ms`);
++  const match = result.blocks.find?.[0];
++  assert.equal(match?.found, 441 * (8 * 4096 + 1));
++  assert.deepEqual(match?.listed.map(({ x, y, z }) => [x, y, z]), [
++    [-290, 44, -266], [-290, 43, -266], [-290, 44, -267],
++  ]);
++});
++
+ test("a box is drawn top layer first as one grid per layer with a legend", () => {
+   const bot = fakeBot({
+     [key(4, 63, 4)]: { name: "stone" },
+diff --git a/src/actions/view-blocks/view-blocks.ts b/src/actions/view-blocks/view-blocks.ts
+index ee38277..e057566 100644
+--- a/src/actions/view-blocks/view-blocks.ts
++++ b/src/actions/view-blocks/view-blocks.ts
+@@ -11,7 +11,7 @@
+  */
+ import type { Bot } from "mineflayer";
+ import { Vec3 } from "vec3";
+-import { findLoadedBlockPositions, isLiquid } from "../../world/index.js";
++import { findAndCountLoadedBlocks, isLiquid } from "../../world/index.js";
+ import { defineAction } from "../action.js";
+ import { blockMatchesSelector } from "../collect-block/collection-facts.js";
+ import {
+@@ -69,16 +69,14 @@ function find(
+   for (const name of request.blockNames) {
+     const stateIds = selectedStateIds(bot, name);
+     if (stateIds.size === 0) return { unknown: name };
+-    // The scan is nearest first and cheap: it reads packed state IDs, so the
+-    // count of everything loaded costs no more than the few that are listed.
+-    const positions = findLoadedBlockPositions(bot, { center: feet, stateIds, limit: Number.POSITIVE_INFINITY });
+-    const listed: FoundBlock[] = positions.slice(0, request.limit).map((position) => ({
++    const { positions, count } = findAndCountLoadedBlocks(bot, { center: feet, stateIds, limit: request.limit });
++    const listed: FoundBlock[] = positions.map((position) => ({
+       ...observe(bot, position),
+       distance: Math.round(position.distanceTo(feet) * 10) / 10,
+       above: nameAt(bot, position.offset(0, 1, 0)),
+       below: nameAt(bot, position.offset(0, -1, 0)),
+     }));
+-    found.push({ name, found: positions.length, listed });
++    found.push({ name, found: count, listed });
+   }
+   return { found };
+ }
+diff --git a/src/world/loaded-block-scan.ts b/src/world/loaded-block-scan.ts
+index 3ba4945..c2aa7c6 100644
+--- a/src/world/loaded-block-scan.ts
++++ b/src/world/loaded-block-scan.ts
+@@ -121,7 +121,16 @@ function retainCandidate(candidates: Candidate[], candidate: Candidate, limit: n
+  * section's packed state IDs and leaves rich block construction to its caller.
+  */
+ export function findLoadedBlockPositions(bot: Bot, scan: LoadedBlockScan): readonly Vec3[] {
+-  if (scan.limit === 0 || scan.stateIds.size === 0) return [];
++  return scanLoadedBlocks(bot, scan, false).positions;
++}
++
++/** Count every match while retaining only the requested nearest positions. */
++export function findAndCountLoadedBlocks(bot: Bot, scan: LoadedBlockScan) {
++  return scanLoadedBlocks(bot, scan, true);
++}
++
++function scanLoadedBlocks(bot: Bot, scan: LoadedBlockScan, countAll: boolean) {
++  if ((!countAll && scan.limit === 0) || scan.stateIds.size === 0) return { positions: [], count: 0 };
+   // prismarine-world's public type omits the 1.18+ column `minY`, while its
+   // runtime column and serialized form both carry it. Parse that library gap
+   // once here instead of spreading assertions through mining.
+@@ -129,12 +138,22 @@ export function findLoadedBlockPositions(bot: Bot, scan: LoadedBlockScan): reado
+   const center = new Vec3(scan.center.x, scan.center.y, scan.center.z).floored();
+   const radiusSquared = scan.radius === undefined ? Number.POSITIVE_INFINITY : scan.radius * scan.radius;
+   const candidates: Candidate[] = [];
++  let count = 0;
+   const local = { x: 0, y: 0, z: 0 };
+   const sections = matchingSections(columns, center, radiusSquared, scan.stateIds);
+   for (const { section, origin, distanceSquared: sectionDistance, order: sectionOrder } of sections) {
+-    // Equal-distance sections can still win the original traversal-order tie.
+-    if (candidates.length === scan.limit && sectionDistance > candidates[candidates.length - 1]!.distanceSquared) break;
+     const singleValue = section.data.value;
++    // Equal-distance sections can still win the original traversal-order tie.
++    const farthest = candidates[candidates.length - 1];
++    const canBeNearest = scan.limit > 0 && (candidates.length < scan.limit || sectionDistance <= farthest!.distanceSquared);
++    if (!canBeNearest) {
++      if (!countAll) break;
++      // Outside the nearest set, an unbounded count can include uniform sections in one step.
++      if (singleValue !== undefined && scan.radius === undefined) {
++        count += 4096;
++        continue;
++      }
++    }
+     for (local.y = 0; local.y < 16; local.y += 1) {
+       const y = origin.y + local.y;
+       const dy = y - center.y;
+@@ -146,17 +165,22 @@ export function findLoadedBlockPositions(bot: Bot, scan: LoadedBlockScan): reado
+           const dx = x - center.x;
+           const horizontalDistanceSquared = dx * dx + dz * dz;
+           if (horizontalDistanceSquared > radiusSquared) continue;
++          if (countAll) {
++            if (singleValue === undefined && !scan.stateIds.has(section.get(local))) continue;
++            count += 1;
++            if (!canBeNearest) continue;
++          }
+           const distanceSquared = horizontalDistanceSquared + dy * dy;
+           const order = sectionOrder * 4096 + local.y * 256 + local.z * 16 + local.x;
+           const worst = candidates[candidates.length - 1];
+           if (candidates.length === scan.limit && worst &&
+             (distanceSquared > worst.distanceSquared || (distanceSquared === worst.distanceSquared && order >= worst.order))) continue;
+-          if (singleValue === undefined && !scan.stateIds.has(section.get(local))) continue;
++          if (!countAll && singleValue === undefined && !scan.stateIds.has(section.get(local))) continue;
+           retainCandidate(candidates, { x, y, z, distanceSquared, order }, scan.limit);
+         }
+       }
+     }
+   }
+   if (scan.limit === Number.POSITIVE_INFINITY) candidates.sort(compareCandidates);
+-  return candidates.map(({ x, y, z }) => new Vec3(x, y, z));
++  return { positions: candidates.map(({ x, y, z }) => new Vec3(x, y, z)), count };
+ }
