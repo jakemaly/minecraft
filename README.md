@@ -24,3 +24,9 @@ Each attempt writes its manifest, Pi JSONL session, activity, server log and wor
 ## Verify
 
 Run `npm run check` and `npm test`. After building the image, run `MINECRAFT_SMOKE=1 node --test test/smoke.test.mjs` for the Docker and Pi integration test.
+
+## Overseer
+
+The user-level `minecraft-overseer.timer` checks the dashboard and run directories every 15 seconds. A terminal attempt or a run directory abandoned by a stopped harness wakes the configured Codex chat. The overseer restarts after a verified fix or recovery and reports deliberate operator stops without restarting. A vanilla-server `Free the End` advancement for the bot takes priority and ends the overseer after it reports the result. The watcher saves its progress in `overseer.json` beside the runs.
+
+Install `deploy/minecraft-overseer.{service,timer}` under `~/.config/systemd/user`. Set `MINECRAFT_OVERSEER_REPO` and `MINECRAFT_OVERSEER_THREAD` in `~/.config/minecraft-overseer.env` to the worktree and existing Codex chat ID. Use `node src/overseer.mjs arm` with the same runtime directory as the dashboard to begin watching subsequent attempts. Enable the timer with `systemctl --user enable --now minecraft-overseer.timer`. To suspend automatic follow-up, stop the timer. The watcher's decisions are visible in `journalctl --user -u minecraft-overseer.service`.

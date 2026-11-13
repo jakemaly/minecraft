@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Acacia for completed or interrupted runs
+
+[Timer]
+OnStartupSec=15s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

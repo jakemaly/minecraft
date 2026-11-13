@@ -1,0 +1,11 @@
+[Unit]
+Description=Wake the Acacia Codex overseer when a run ends
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/minecraft-mine-ai
+EnvironmentFile=%h/.config/minecraft-mine-ai.env
+EnvironmentFile=%h/.config/minecraft-overseer.env
+ExecStart=/usr/bin/node src/overseer.mjs
+TimeoutStartSec=infinity
+UMask=0077

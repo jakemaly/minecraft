@@ -28,9 +28,9 @@ export async function recoverRuns(root) {
   if (networks.length) await docker(['network', 'rm', ...networks], { timeout: 15_000 });
 }
 
-export function dragonAdvancement(log) {
+export function dragonAdvancement(log, username = bot) {
   return log.match(new RegExp(
-    String.raw`^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: ${RegExp.escape(bot)} has made the advancement \[Free the End\]\r?$`,
+    String.raw`^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: ${RegExp.escape(username)} has made the advancement \[Free the End\]\r?$`,
     'm',
   ))?.[0].trimEnd() ?? null;
 }
@@ -99,8 +99,8 @@ export function startRun(config) {
   const run = {
     id, seed, state: 'starting', activity: [], detail: null,
     viewer: `http://${config.host}:${config.viewerPort}/`, spectator: `${config.host}:${config.gamePort}`,
-    stop() {
-      if (!signal.aborted) abort.abort(operatorStop);
+    stop(reason = operatorStop) {
+      if (!signal.aborted) abort.abort(reason);
       return run.done;
     },
   };
@@ -135,10 +135,11 @@ export function startRun(config) {
       await mkdir(directory, { mode: 0o700 });
       await Promise.all([world, data, sockets].map(path => mkdir(path, { mode: 0o700 })));
       if (Buffer.byteLength(join(sockets, 'viewer.sock')) >= 108) throw new Error('Run directory is too long for Unix sockets.');
-      await writeFile(join(directory, 'run.json'), JSON.stringify({
+      await writeFile(join(directory, 'run.json.tmp'), JSON.stringify({
         id, seed, bot, version: '1.21.4', jarHash, revision, model: modelId, thinkingLevel,
         promptSha256: createHash('sha256').update(await readFile(new URL('../deploy/prompt.txt', import.meta.url))).digest('hex'),
       }, null, 2));
+      await rename(join(directory, 'run.json.tmp'), join(directory, 'run.json'));
       hasManifest = true;
       signal.throwIfAborted();
       const inspected = await docker(['image', 'inspect', mineImage], { timeout: 10_000 });
@@ -225,7 +226,7 @@ export function startRun(config) {
       }
     } catch (failure) {
       stopped = signal.reason === operatorStop;
-      if (!stopped && !proof) error ??= failure.message;
+      if (!stopped && !proof) error ??= signal.reason?.message ?? failure.message;
     } finally {
       run.state = 'saving';
       abort.abort();
@@ -250,9 +251,10 @@ export function startRun(config) {
       const state = proof ? 'won' : stopped && !error ? 'stopped' : 'incomplete';
       const detail = proof ? [proof, error].filter(Boolean).join(' · ') : error ?? run.detail ?? 'Stopped by operator.';
       if (hasManifest) {
-        await writeFile(join(directory, 'result.json'), JSON.stringify({
+        await writeFile(join(directory, 'result.json.tmp'), JSON.stringify({
           state, detail, player: run.player, cleanupError: proof ? error : undefined,
         }, null, 2));
+        await rename(join(directory, 'result.json.tmp'), join(directory, 'result.json'));
       }
       Object.assign(run, { state, detail });
     }

@@ -101,7 +101,7 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
     port: server.address().port,
     async close() {
       const closed = new Promise(ready => server.close(ready));
-      if (active()) await run.stop().catch(() => {});
+      if (active()) await run.stop(new Error('Harness service shut down.')).catch(() => {});
       await closed;
       lock.close();
     },
