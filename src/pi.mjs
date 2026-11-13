@@ -81,7 +81,7 @@ export async function play({ directory, socket, agentDir, signal, record, infere
         const response = result.structuredContent?.response;
         // Polling or retrieving an old result again does not make progress.
         const completed = response?.data?.output?.action ? response.data.actionId
-          : (response?.markdown ?? '').match(/^Action ID: ([a-f0-9-]+)\n## `/)?.[1];
+          : response?.markdown?.match(/^Action ID: ([a-f0-9-]+)\n\n## `/)?.[1];
         if (!result.isError && completed && !completedActions.has(completed)) {
           completedActions.add(completed);
           continuationsWithoutAction = 0;

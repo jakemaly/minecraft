@@ -43,13 +43,13 @@ export async function scriptedInference(agentDir, scenario) {
           actionId = result.actionId;
         }
         content = [call('wait_for_action', {
-          action_id: actionId, timeout_ms: 120_000, rationale: 'Retrieve the existing jump.', response_format: 'json',
+          action_id: actionId, timeout_ms: 120_000, rationale: 'Retrieve the existing jump.',
+          ...(stage === 4 ? { response_format: 'json' } : {}),
         })];
       }
       if (stage === 3) {
-        const result = JSON.parse(lastResult.content[0].text).response.data;
-        assert.equal(result.state, 'settled');
-        assert.equal(result.actionId, actionId);
+        assert.ok(lastResult.content[0].text.startsWith(`Action ID: ${actionId}\n\n## `));
+        assert.match(lastResult.content[0].text, /\*\*Status:\*\* succeeded/);
       }
     }
     const errorMessage = scenario === 'provider' && stage > 0 ? '401: OAuth session expired' : undefined;
@@ -159,7 +159,7 @@ test('a premature final reply preserves a pending action and stale results do no
     const settled = final.activity.findIndex(event => event.type === 'tool_execution_end' &&
       event.tool === 'mcp__minecraft__wait_for_action' && event.outcome === 'settled' && !event.isError);
     assert.ok(earlyFinal >= 0 && settled > earlyFinal);
-    assert.equal(final.activity.filter(event => event.type === 'continuation').length, 4);
+    assert.deepEqual(final.activity.filter(event => event.type === 'continuation').map(event => event.attempt), [1, 1, 2, 3]);
     assert.match(final.detail, /3 follow-ups produced no completed Minecraft action/);
   }));
 
