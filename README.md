@@ -19,7 +19,7 @@ Open http://127.0.0.1:2718. The default Pi credential directory is `~/.local/sha
 
 For the user service, install the app at `~/.local/opt/minecraft-mine-ai` and install `deploy/minecraft-agent.service` in `~/.config/systemd/user`. Set `MINECRAFT_HOST` and `MINECRAFT_CLIENT_TAILSCALE_IP` in `~/.config/minecraft-mine-ai.env` to the server and operator addresses, respectively. The default ports are 2718 for the dashboard, 3000 for the viewer, and 25565 for Minecraft. Keep the corresponding tailnet grants. MCP crosses the sandbox on a private Unix socket. Docker runs the game and bot with an isolated bridge, read-only roots, dropped capabilities, resource limits, and per-run writable mounts.
 
-Each attempt writes its manifest, Pi JSONL session, activity, server log and world, and Mine AI SQLite data under `~/.local/share/mine-ai`. A new run always gets a new directory. An early final model answer or terminal provider error ends the attempt.
+Each attempt writes its manifest, Pi JSONL session, activity, server log and world, and Mine AI SQLite data under `~/.local/share/mine-ai`. A new run always gets a new directory. If the model ends early, Pi prompts it again in the same session. Three follow-ups without a newly completed action end the attempt as incomplete. Pi reconnects expired MCP sessions in place. Terminal provider errors and operator stops end the attempt.
 
 ## Verify
 

@@ -128,7 +128,7 @@ function renderStatus() {
   const pending = activity.findLast(event => event.type === 'tool_execution_start' &&
     !activity.some(other => other.type === 'tool_execution_end' && other.id === event.id));
   setAgent(run.state === 'running' ? pending ? pending.tool.endsWith('__navigate') ? 'walking' : 'acting' : 'thinking' : 'idle',
-    pending ? title(toolLabel(pending.tool)) : 'Thinking');
+    pending ? title(toolLabel(pending.tool)) : activity.at(-1)?.type === 'continuation' ? 'Continuing the run' : 'Thinking');
   renderHealth();
 }
 

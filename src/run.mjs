@@ -30,15 +30,15 @@ export async function recoverRuns(root) {
 
 export function dragonAdvancement(log) {
   return log.match(new RegExp(
-    String.raw`^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: ${RegExp.escape(bot)} has made the advancement \[Free the End\]?$`,
+    String.raw`^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: ${RegExp.escape(bot)} has made the advancement \[Free the End\]\r?$`,
     'm',
   ))?.[0].trimEnd() ?? null;
 }
 
-async function verifiedJar(root, path) {
+async function verifiedJar(root, path, signal) {
   const check = async file => {
     const hash = createHash('sha1');
-    for await (const chunk of createReadStream(file)) hash.update(chunk);
+    for await (const chunk of createReadStream(file, { signal })) hash.update(chunk);
     if (hash.digest('hex') !== jarHash) throw new Error('Minecraft server JAR checksum mismatch.');
   };
   try {
@@ -46,12 +46,12 @@ async function verifiedJar(root, path) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
     const response = await fetch(`https://piston-data.mojang.com/v1/objects/${jarHash}/server.jar`, {
-      signal: AbortSignal.timeout(90_000),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(90_000)]),
     });
     if (!response.ok) throw new Error(`Minecraft server download failed (HTTP ${response.status}).`);
     const temporary = join(root, `server-${randomUUID()}.tmp`);
     try {
-      await writeFile(temporary, response.body, { mode: 0o600 });
+      await writeFile(temporary, response.body, { mode: 0o600, signal });
       await check(temporary);
       await rename(temporary, path);
     } finally {
@@ -90,18 +90,28 @@ export function startRun(config) {
   const network = `mineai-${id}`;
   const abort = new AbortController();
   const { signal } = abort;
+  const operatorStop = new Error('Stopped by operator.');
+  let error;
+  const fail = failure => {
+    error ??= failure.message;
+    abort.abort(failure);
+  };
   const run = {
     id, seed, state: 'starting', activity: [], detail: null,
     viewer: `http://${config.host}:${config.viewerPort}/`, spectator: `${config.host}:${config.gamePort}`,
     stop() {
-      if (!signal.aborted) abort.abort(new Error('Stopped by operator.'));
+      if (!signal.aborted) abort.abort(operatorStop);
       return run.done;
     },
   };
   const record = (type, payload) => {
     const event = { time: new Date().toISOString(), type, ...payload };
-    appendFileSync(join(directory, 'activity.jsonl'), `${JSON.stringify(event)}\n`, { mode: 0o600 });
-    if (type !== 'catalogue') run.activity = [...run.activity.slice(-79), event];
+    try {
+      appendFileSync(join(directory, 'activity.jsonl'), `${JSON.stringify(event)}\n`, { mode: 0o600 });
+      if (type !== 'catalogue') run.activity = [...run.activity.slice(-79), event];
+    } catch (failure) {
+      fail(new Error(`Could not record run activity: ${failure.message}`));
+    }
   };
   run.done = execute();
   return run;
@@ -119,11 +129,6 @@ export function startRun(config) {
     let server, serverExit, mineExit, agent, networkCreated, hasManifest, proof, stopped = false;
     let ready = false;
     let savedWorld = false;
-    let error;
-    const fail = failure => {
-      error ??= failure.message;
-      abort.abort(failure);
-    };
     let finishWin;
     const won = new Promise(resolve => { finishWin = resolve; });
     try {
@@ -142,7 +147,8 @@ export function startRun(config) {
         throw new Error('The Mine AI image does not match the pinned source revision.');
       }
       const jar = config.jar ?? join(config.root, 'server.jar');
-      await verifiedJar(config.root, jar);
+      await verifiedJar(config.root, jar, signal);
+      signal.throwIfAborted();
       await writeFile(join(world, 'eula.txt'), 'eula=true\n');
       await writeFile(join(world, 'server.properties'), [
         'online-mode=false', 'gamemode=spectator', 'force-gamemode=true', 'difficulty=normal', 'hardcore=false',
@@ -175,6 +181,7 @@ export function startRun(config) {
           proof = evidence;
           record('advancement', { advancement, evidence });
           finishWin(evidence);
+          abort.abort();
         }
       }));
       await waitFor(() => ready, serverExit);
@@ -186,15 +193,17 @@ export function startRun(config) {
       await waitFor(() => pinSocket('mcp'), mineExit);
       const dispatcher = new Agent({ connect: { socketPath: mcp } });
       const health = async () => {
-        const response = await fetch('http://127.0.0.1:25575/health', { dispatcher, signal: AbortSignal.timeout(2000) });
+        const response = await fetch('http://127.0.0.1:25575/health', {
+          dispatcher, signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+        });
         const status = await response.json();
-        if (!status.ok || !status.minecraft?.connected || status.minecraft.username !== bot || status.minecraft.gamemode !== 'survival') return false;
-        const { health, food, inventory } = status.minecraft;
+        if (!status.ok || !status.minecraft?.connected || status.minecraft.username !== bot) return null;
+        const { health, food, inventory, gamemode } = status.minecraft;
         run.player = { health, food, inventory };
-        return true;
+        return { gamemode };
       };
       try {
-        await waitFor(async () => playing && await health().catch(() => false), mineExit);
+        await waitFor(async () => playing && (await health().catch(() => null))?.gamemode === 'survival', mineExit);
         if (!await pinSocket('viewer') || !await pinSocket('game')) throw new Error('Mine AI viewer or spectator socket is missing.');
         forwards.push(await forward(config.host, config.viewerPort, join(directory, 'viewer.sock'), config.allowed));
         forwards.push(await forward(config.host, config.gamePort, join(directory, 'game.sock'), config.allowed));
@@ -215,8 +224,8 @@ export function startRun(config) {
         await dispatcher.destroy();
       }
     } catch (failure) {
-      stopped = signal.aborted;
-      if (!stopped) error = failure.message;
+      stopped = signal.reason === operatorStop;
+      if (!stopped && !proof) error ??= failure.message;
     } finally {
       run.state = 'saving';
       abort.abort();
