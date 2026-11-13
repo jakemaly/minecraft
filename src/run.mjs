@@ -185,7 +185,10 @@ export function startRun(config) {
       const health = async () => {
         const response = await fetch('http://127.0.0.1:25575/health', { dispatcher, signal: AbortSignal.timeout(2000) });
         const status = await response.json();
-        return status.ok && status.minecraft?.connected && status.minecraft.gamemode === 'survival';
+        if (!status.ok || !status.minecraft?.connected || status.minecraft.gamemode !== 'survival') return false;
+        const { health, food, inventory } = status.minecraft;
+        run.player = { health, food, inventory };
+        return true;
       };
       try {
         await waitFor(async () => playing && await health().catch(() => false), mineExit);
@@ -236,7 +239,7 @@ export function startRun(config) {
       const detail = proof ? [proof, error].filter(Boolean).join(' · ') : error ?? run.detail ?? 'Stopped by operator.';
       if (hasManifest) {
         await writeFile(join(directory, 'result.json'), JSON.stringify({
-          state, detail, cleanupError: proof ? error : undefined,
+          state, detail, player: run.player, cleanupError: proof ? error : undefined,
         }, null, 2));
       }
       Object.assign(run, { state, detail });

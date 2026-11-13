@@ -102,6 +102,8 @@ test('Pi settles a real Mine AI action and an early victory claim leaves the att
       run = await status();
       if (run.state === 'running') {
         assert.equal((await fetch(run.viewer)).status, 200);
+        assert.equal(run.player.health, 20);
+        assert.ok(Array.isArray(run.player.inventory));
         await new Promise((resolve, reject) => {
           const client = createConnection({ host, port: gamePort });
           client.on('error', reject);

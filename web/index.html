@@ -1,143 +1,293 @@
 <!doctype html>
 <html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Minecraft · Mine AI</title>
-<style>
-  :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #161b16; color: #edf1e8; }
-  body { max-width: 74rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
-  h1 { margin: 0; font-size: clamp(1.8rem, 5vw, 3rem); }
-  h2 { font-size: 1rem; }
-  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
-  p { margin: .55rem 0; }
-  .muted { color: #bdc8b8; }
-  button { border: 1px solid #657762; border-radius: .4rem; padding: .6rem .9rem; font: inherit; background: #242e24; color: inherit; cursor: pointer; }
-  button:first-child { background: #c8eba6; border-color: #c8eba6; color: #18220f; }
-  button:disabled { opacity: .45; cursor: default; }
-  button:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
-  main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(15rem, 1fr); gap: 1rem; margin-top: 1.5rem; }
-  section { min-width: 0; border: 1px solid #39463a; border-radius: .6rem; background: #1c231c; padding: 1rem; }
-  section h2 { margin-top: 0; }
-  #view { aspect-ratio: 16 / 9; background: #111710; display: grid; place-items: center; }
-  iframe { width: 100%; height: 100%; border: 0; }
-  ol { margin: 0; padding: 0; list-style: none; max-height: 30rem; overflow: auto; }
-  li { padding: .45rem 0; border-bottom: 1px solid #39463a; overflow-wrap: anywhere; }
-  time { display: block; font-size: .8rem; }
-  #error { color: #ffc6bb; }
-  @media (max-width: 48rem) { main { grid-template-columns: 1fr; } }
-</style>
-<header>
-  <div>
-    <h1>Mine AI</h1>
-    <p class="muted">Minecraft 1.21.4 · Survival · Seed 97996358</p>
-    <p id="state" role="status">Connecting…</p>
-    <p id="detail"></p>
-    <p id="error" role="alert"></p>
-  </div>
-  <div><button id="start" disabled>Start fresh run</button> <button id="stop" disabled>Stop and save</button></div>
-</header>
-<main>
-  <section aria-labelledby="world-title">
-    <h2 id="world-title">First-person view</h2>
-    <div id="view"><span class="muted">The viewer opens when the bot joins.</span></div>
-    <p id="spectator" class="muted" hidden></p>
-  </section>
-  <section aria-labelledby="activity-title">
-    <h2 id="activity-title">Live activity</h2>
-    <ol id="activity"></ol>
-  </section>
-</main>
-<script type="module">
-  const byId = id => document.getElementById(id);
-  const view = byId('view');
-  const start = byId('start');
-  const stop = byId('stop');
-  let pending = false;
-  let renderedActivity = '';
-  let revision = 0;
-  let status = { state: 'connecting' };
-
-  function controls() {
-    start.disabled = pending || ['connecting', 'starting', 'running', 'saving'].includes(status.state);
-    stop.disabled = pending || !['starting', 'running'].includes(status.state);
-  }
-
-  function render(run) {
-    status = run;
-    const label = run.state === 'won' ? 'Dragon defeated' : run.state[0].toUpperCase() + run.state.slice(1);
-    if (byId('state').textContent !== label) byId('state').textContent = label;
-    byId('detail').textContent = run.detail ?? '';
-    controls();
-    if ((run.viewer ?? '') !== (view.dataset.url ?? '')) {
-      view.dataset.url = run.viewer ?? '';
-      if (run.viewer) {
-        const frame = document.createElement('iframe');
-        frame.title = 'Live first-person Minecraft view';
-        frame.src = run.viewer;
-        frame.allowFullscreen = true;
-        view.replaceChildren(frame);
-      } else {
-        view.textContent = 'The viewer opens when the bot joins.';
-      }
-    }
-    byId('spectator').hidden = !run.spectator;
-    byId('spectator').textContent = run.spectator ? `Join as spectator in Minecraft at ${run.spectator}` : '';
-    const activity = JSON.stringify(run.activity);
-    if (activity === renderedActivity) return;
-    renderedActivity = activity;
-    byId('activity').replaceChildren(...run.activity.toReversed().map(event => {
-      const item = document.createElement('li');
-      const time = document.createElement('time');
-      time.dateTime = event.time;
-      time.className = 'muted';
-      time.textContent = new Date(event.time).toLocaleTimeString();
-      const tool = event.tool?.replace('mcp__minecraft__', '').replaceAll('_', ' ');
-      const label = ({
-        tool_execution_start: `Started ${tool}`, tool_execution_end: `${event.isError ? 'Error in' : 'Returned from'} ${tool}${event.outcome ? ` · ${event.outcome}` : ''}`,
-        assistant: event.errorMessage || `Model response · ${event.model}`,
-        advancement: 'Free the End', spectator: `${event.name} joined as spectator`,
-      })[event.type] ?? event.type;
-      item.append(time, label);
-      return item;
-    }));
-  }
-
-  async function request(path, method = 'GET') {
-    const response = await fetch(path, { method });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error);
-    return data;
-  }
-
-  async function change(action) {
-    pending = true;
-    revision++;
-    controls();
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Acacia</title>
+  <script>
     try {
-      render(await request(`/api/${action}`, 'POST'));
-      byId('error').textContent = '';
-    } catch (error) {
-      byId('error').textContent = error.message;
-    } finally {
-      pending = false;
-      controls();
+      const savedTheme = localStorage.getItem('minecraft-agent-theme');
+      const theme = savedTheme || 'dark';
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.dataset.webtuiTheme = theme;
+    } catch {
+      document.documentElement.dataset.theme = 'dark';
+      document.documentElement.dataset.webtuiTheme = 'dark';
     }
-  }
+  </script>
+  <style>@layer base, utils, components;</style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@webtui/css@0.1.10/dist/base.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@webtui/css@0.1.10/dist/components/pre.css">
+  <style>
+    @font-face { font-family: Monocraft; src: url('https://cdn.jsdelivr.net/gh/IdreesInc/Monocraft@v4.2.1/dist/Monocraft-ttf/Monocraft.ttf') format('truetype'); font-display: swap; }
+    :root[data-theme="dark"] {
+      color-scheme: dark; --bg:#121613; --panel:#171c18; --text:#e1e6de; --muted:#99a396; --line:#38423b;
+      --hover:#202a22; --green:#a6d494; --blue:#9bcbd2; --red:#ed9a8e; --viewer:#0b0f0c;
+      --output:#bac4b7; --trace-bg:#222321; --trace-plan:#303039; --trace-tool:#233528;
+      --background0:var(--bg); --background1:#303039; --background2:#233528; --background3:#38423b;
+      --foreground0:var(--text); --foreground1:var(--output); --foreground2:var(--muted); --box-border-color:var(--line); --pre-background:transparent;
+    }
+    :root[data-theme="light"] {
+      color-scheme:light; --bg:#f4f3ee; --panel:#ebece6; --text:#20251f; --muted:#727970; --line:#d3d8cf;
+      --hover:#e3e7df; --green:#477746; --blue:#426c75; --red:#a24e44; --viewer:#111411;
+      --output:#5e665c; --trace-bg:#e8e9e6; --trace-plan:#e3e4e9; --trace-tool:#e1e9df;
+      --background0:var(--bg); --background1:#e4e5e0; --background2:#dce7dc; --background3:#cbd8cb;
+      --foreground0:var(--text); --foreground1:#5e665c; --foreground2:var(--muted); --box-border-color:var(--line); --pre-background:transparent;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; min-width:900px; height:100vh; height:100dvh; overflow:hidden; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,sans-serif; transition:background-color .18s,color .18s; }
+    button,select,input { font:inherit; color:inherit; }
+    button { min-height:30px; padding:4px 8px; border:0; border-radius:2px; background:transparent; color:var(--text); cursor:pointer; }
+    button:hover { background:var(--hover); }
+    button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible { outline:2px solid var(--green); outline-offset:2px; }
+    button:disabled { opacity:.42; cursor:not-allowed; }
+    button.primary { padding-inline:12px; background:var(--green); color:var(--bg); font-weight:650; }
+    button.primary:hover { filter:brightness(.94); }
+    button.danger { color:var(--red); }
+    select,input { min-height:30px; padding:4px 6px; border:0; border-bottom:1px solid var(--line); border-radius:0; background:transparent; }
+    a { color:var(--blue); }
+    [hidden] { display:none !important; }
+    .app { width:100%; height:100%; margin:0 auto; padding:18px 28px 24px; display:grid; grid-template-rows:auto minmax(0,1fr); }
+    .topbar { display:flex; align-items:center; gap:18px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+    .topbar .context-tabs { align-self:stretch; align-items:flex-end; margin:0 0 -14px auto; border-bottom:0; }
+    .brand h1 { margin:0; font-size:21px; line-height:1.25; font-weight:620; letter-spacing:-.025em; }
+    .brand p { display:flex; align-items:center; gap:5px; margin:4px 0 0; color:var(--muted); font-size:12px; }
+    .connection,.auth { display:flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0; }
+    .connection { gap:7px; color:var(--muted); font:inherit; white-space:nowrap; }
+    .auth { justify-content:flex-start; gap:12px; }
+    .auth a,.auth button { font:inherit; }
+    .auth input { width:180px; min-width:150px; font:inherit; }
+    #model-slot { min-width:0; width:min(100%,280px); }
+    #model-picker { width:100%; max-width:100%; }
+    .world-rule { color:var(--text); }
+    #run-detail { color:var(--muted); font:12px/1.4 system-ui,sans-serif; }
+    .model-controls { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
+    .reasoning-control { display:grid; grid-template-columns:82px 76px; align-items:center; gap:8px; color:var(--muted); white-space:nowrap; }
+    .reasoning-control output { display:inline-block; width:76px; color:var(--text); white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .error { display:none; position:absolute; z-index:4; top:90px; left:28px; right:28px; padding:8px 10px; border-left:2px solid var(--red); background:var(--panel); color:var(--red); }
+    .studio-layout { min-height:0; display:grid; grid-template-columns:minmax(0,2fr) minmax(340px,1fr); gap:24px; overflow:hidden; }
+    .stage-column { min-width:0; min-height:0; display:flex; flex-direction:column; padding-top:16px; }
+    .context-column { min-width:0; min-height:0; display:flex; flex-direction:column; padding:0; }
+    .agent-under-viewer { display:grid; gap:4px; width:100%; margin-top:4px; }
+    .agent-card { display:grid; grid-template-columns:180px minmax(0,1fr); align-items:center; gap:8px 18px; min-width:0; padding:6px 0 4px; font:13px/1.4 system-ui,sans-serif; }
+    .agent-stage { display:grid; width:100%; height:180px; place-items:center; overflow:hidden; }
+    .steve { display:block; height:172px; width:auto; object-fit:contain; image-rendering:pixelated; transform-origin:50% 85%; }
+    .agent-card[data-mode="thinking"] .steve { animation:thinking 2.5s ease-in-out infinite; }
+    .agent-card[data-mode="acting"] .steve { animation:acting .55s ease-in-out infinite alternate; }
+    .agent-card[data-mode="walking"] .steve { animation:walking .4s ease-in-out infinite alternate; }
+    .activity-block { display:grid; align-content:center; justify-items:start; gap:8px; min-width:0; }
+    .activity-line { display:flex; align-items:center; justify-content:flex-start; gap:7px; }
+    .activity-line::before { width:7px; height:7px; flex:0 0 7px; content:""; border-radius:50%; background:var(--muted); }
+    .agent-card[data-mode="thinking"] .activity-line::before,.agent-card[data-mode="acting"] .activity-line::before,.agent-card[data-mode="walking"] .activity-line::before { background:var(--green); }
+    .activity-line h3 { display:inline-block; max-width:100%; margin:0; padding:4px 8px; border-radius:2px; background:var(--trace-tool); color:var(--green); font:600 14px/1.3 system-ui,sans-serif; overflow-wrap:anywhere; }
+    .agent-card[data-mode="idle"] .activity-line h3 { background:transparent; color:var(--muted); padding-left:0; }
+    .current-task { min-width:0; display:flex; align-items:baseline; gap:8px; padding:4px 0 8px; color:var(--text); font:13px/1.4 system-ui,sans-serif; }
+    .current-task-label { flex:0 0 auto; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+    .current-task-text { min-width:0; overflow-wrap:anywhere; }
+    .agent-controls { display:flex; align-items:center; gap:6px; margin:0; font:12px/1.4 system-ui,sans-serif; }
+    .workspace-heading { display:flex; justify-content:space-between; gap:10px; padding:8px 2px; color:var(--green); white-space:nowrap; }
+    .runs-panel { min-height:0; flex:1; display:flex; flex-direction:column; margin-top:8px; overflow:hidden; font:12px/1.5 system-ui,sans-serif; }
+    .runs-view { min-height:0; flex:1; display:flex; flex-direction:column; overflow:hidden; }
+    .run-list { min-height:0; flex:1; overflow:auto; scrollbar-color:var(--line) var(--bg); }
+    .run-library-item { display:grid; gap:3px; width:100%; padding:10px 8px; border-bottom:1px solid var(--line); border-radius:0; text-align:left; }
+    .run-library-item:hover,.run-library-item[aria-current="true"] { background:var(--hover); }
+    .run-library-title { display:flex; align-items:center; justify-content:space-between; gap:8px; color:var(--text); font-weight:600; }
+    .run-library-meta,.run-library-empty { color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+    .run-detail-content { min-height:0; flex:1; overflow:auto; padding:8px 2px 16px; scrollbar-color:var(--line) var(--bg); }
+    .run-detail-heading { margin:8px 0 2px; font-size:16px; font-weight:620; }
+    .run-detail-facts { display:grid; grid-template-columns:80px minmax(0,1fr); gap:4px 10px; margin:8px 0 14px; color:var(--muted); font-size:12px; }
+    .run-detail-facts dt { color:var(--muted); }
+    .run-detail-facts dd { min-width:0; margin:0; color:var(--text); overflow-wrap:anywhere; }
+    .run-detail-timeline { display:grid; gap:8px; }
+    .run-library-event { padding:8px 9px; border-left:2px solid var(--line); background:var(--trace-bg); overflow-wrap:anywhere; }
+    .run-library-event[data-kind="death"] { border-left-color:var(--red); }
+    .run-library-event[data-kind="success"] { border-left-color:var(--green); }
+    .run-library-event time { display:block; color:var(--muted); font-size:10px; }
+    .run-detail-actions { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .run-library-status { padding:6px 2px; color:var(--muted); font-size:11px; }
+    .stage-column .playback-panel { display:flex; flex-direction:column; flex:0 0 auto; }
+    .playback-meta { min-width:0; display:flex; align-items:center; flex-wrap:wrap; gap:5px 18px; padding:8px 2px 0; }
+    .context-tabs { display:flex; align-items:center; gap:18px; flex:0 0 auto; }
+    .context-tab { min-height:34px; padding:5px 2px; border-bottom:2px solid transparent; border-radius:0; color:var(--muted); font:12px system-ui,sans-serif; }
+    .context-tab[aria-selected="true"] { border-bottom-color:var(--green); color:var(--text); }
+    .context-tab:hover { background:transparent; color:var(--text); }
+    .trace-panel { position:relative; min-height:0; flex:1 1 auto; display:flex; flex-direction:column; background:var(--trace-bg); color:var(--text); }
+    .trace { min-height:0; flex:1; overflow:auto; overflow-anchor:none; overscroll-behavior:contain; scrollbar-gutter:stable; padding:4px 16px 16px; background:var(--trace-bg); color:var(--text); font:12px/1.65 Monocraft,monospace; scrollbar-color:var(--line) var(--trace-bg); }
+    .trace-event { margin:0; padding:12px 3px; border:0; background:transparent; overflow-wrap:anywhere; }
+    .trace-event+.trace-event { margin-top:12px; }
+    .trace-event.message { padding:10px 12px; border-left:2px solid var(--blue); background:var(--trace-plan); }
+    .trace-plan { padding:14px 16px; background:var(--trace-plan); color:var(--text); white-space:pre-wrap; }
+    .trace-tool { padding:14px 16px; border-left:2px solid #52634f; background:var(--trace-tool); color:var(--text); }
+    .trace-meta { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:5px; color:var(--muted); font-size:10px; }
+    .trace-kind { color:var(--green); }
+    .trace-time { white-space:nowrap; }
+    .trace-command { margin:0; padding:0; border:0; background:transparent; color:var(--text); white-space:pre-wrap; font:inherit; font-weight:700; }
+    .trace-command .prompt { color:var(--green); }
+    .trace-command-args { font-weight:400; }
+    .trace-text { --pre-background:transparent; margin:5px 0 0; color:var(--text); white-space:pre-wrap; overflow-wrap:anywhere; }
+    .trace-output { --pre-background:transparent; max-height:320px; overflow:auto; margin:10px 0 0; color:var(--output); white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
+    .trace-output.error-text { color:var(--red); }
+    .trace-tool .trace-meta { margin:9px 0 0; color:var(--muted); }
+    .trace-metrics { margin-top:7px; color:var(--muted); font-size:10px; }
+    .trace-live { padding:12px 3px; }
+    .trace-live .trace-text { white-space:pre-wrap; }
+    .stream-cursor { display:inline-block; margin-left:3px; color:var(--green); animation:cursor-blink 1s steps(2,start) infinite; }
+    @keyframes cursor-blink { to { visibility:hidden; } }
+    .trace-details { margin-top:5px; }
+    .trace-details summary { padding:4px 0; color:var(--muted); cursor:pointer; }
+    .trace-details summary:hover { color:var(--text); }
+    .load-more { display:block; margin:4px 0 10px; padding:4px 0; color:var(--blue); }
+    .trace-empty { padding:28px 0; color:var(--muted); }
+    .trace-bottom { position:absolute; right:20px; bottom:18px; z-index:2; padding:7px 12px; border:1px solid var(--line); border-radius:999px; background:var(--bg); color:var(--text); box-shadow:0 4px 18px #0004; font:12px system-ui,sans-serif; }
+    .trace-bottom:hover { background:var(--hover); }
+    .trace-bottom[hidden] { display:none; }
+    .viewer { position:relative; width:100%; height:auto; aspect-ratio:384 / 216; overflow:hidden; background:var(--viewer); }
+    .viewer iframe { display:block; width:100%; height:100%; border:0; }
+    .viewer-empty { display:grid; width:100%; height:100%; place-items:center; padding:22px; color:#adb5a9; text-align:center; font:12px/1.6 system-ui,sans-serif; }
+    .health-row { display:flex; align-items:center; gap:8px; min-height:28px; padding:6px 2px; }
+    .health-label { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+    .hearts { display:flex; align-items:center; gap:1px; }
+    .heart { width:14px; height:14px; image-rendering:pixelated; }
+    .health-value { margin-left:auto; color:var(--muted); font:11px system-ui,sans-serif; }
+    .foods { display:flex; align-items:center; gap:1px; }
+    .food { width:14px; height:14px; image-rendering:pixelated; }
+    .inventory-panel { min-width:0; padding:2px 0 6px; color:var(--text); font:12px/1.4 system-ui,sans-serif; }
+    .inventory-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; color:var(--muted); font-size:11px; }
+    .inventory-items { display:flex; flex-wrap:wrap; gap:4px 8px; max-height:58px; overflow:auto; }
+    .inventory-item { display:inline-flex; align-items:center; gap:3px; min-height:24px; white-space:nowrap; }
+    .inventory-icon { width:20px; height:20px; object-fit:contain; image-rendering:pixelated; }
+    .inventory-item-name { color:var(--text); font-size:10px; }
+    .inventory-count { color:var(--muted); font:10px Monocraft,monospace; }
+    .inventory-empty { color:var(--muted); font-size:11px; }
+    .run-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-width:0; }
+    .dot { display:inline-block; width:7px; height:7px; margin-right:4px; border-radius:50%; background:var(--muted); }
+    .dot.ready,.switch-dot { background:var(--green); }
+    .run-state { display:inline-flex; align-items:center; gap:7px; margin-right:4px; color:var(--muted); white-space:nowrap; font:13px/1.4 system-ui,sans-serif; }
+    .run-state::before { width:6px; height:6px; flex:0 0 6px; content:""; border-radius:50%; background:currentColor; opacity:.72; }
+    .run-state.ready { color:var(--green); }
+    .playback-meta .run-actions { margin-left:auto; }
+    .run-actions button { min-height:32px; padding:5px 10px; font:13px system-ui,sans-serif; }
+    .theme-toggle { display:flex; align-items:center; gap:8px; width:116px; justify-content:space-between; margin-top:auto; padding:8px 2px 0; text-align:left; color:var(--text); font:12px system-ui,sans-serif; }
+    .switch-track { display:flex; width:28px; height:15px; justify-content:flex-end; align-items:center; padding:2px; background:var(--trace-tool); }
+    .switch-dot { display:block; width:11px; height:11px; background:url("assets/dark-theme-enabled.svg") center/contain no-repeat; }
+    :root[data-theme="light"] .switch-track { justify-content:flex-start; background:var(--line); }
+    :root[data-theme="light"] .switch-dot { filter:grayscale(1); }
+    @keyframes thinking { 50% { transform:translateY(-5px) rotate(-1deg); } }
+    @keyframes acting { to { transform:translateY(-3px) rotate(2deg); } }
+    @keyframes walking { to { transform:translateY(-2px); } }
+    @media (max-width:1100px) {
+      .app { padding:16px 18px 20px; }
+      .studio-layout { grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr); gap:18px; }
+      .agent-card { grid-template-columns:156px minmax(0,1fr); gap:8px 14px; }
+      .steve { height:148px; }
+      .agent-stage { height:156px; }
+      .error { left:18px; right:18px; }
+    }
+    @media (max-width:760px) {
+      body { min-width:0; overflow:auto; }
+      .app { min-height:100dvh; height:auto; grid-template-rows:auto auto; }
+      .topbar { align-items:flex-start; flex-wrap:wrap; }
+      .topbar .context-tabs { width:100%; margin:0; }
+      .studio-layout { grid-template-columns:minmax(0,1fr); overflow:visible; }
+      .context-column { min-height:560px; border-left:0; border-top:1px solid var(--line); padding:12px 0 0; }
+      .stage-column { overflow:visible; }
+      .agent-card { grid-template-columns:136px minmax(0,1fr); gap:8px 12px; }
+      .steve { height:128px; }
+      .agent-stage { height:136px; }
+      .theme-toggle { margin-top:16px; }
+    }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; animation-duration:.01ms!important; animation-iteration-count:1!important; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand"><h1>Acacia</h1>
+        <p><span>Goal</span><span class="world-rule">Beat the Ender Dragon</span></p>
+        <p class="world-rules"><span>Difficulty</span><span class="world-rule">Normal</span><span>· Seed 97996358</span></p>
+      </div>
+      <div class="context-tabs" role="tablist" aria-label="Agent details">
+        <button id="conversation-tab" class="context-tab" type="button" role="tab" aria-controls="trace-panel" aria-selected="true">Conversation</button>
+        <button id="runs-tab" class="context-tab" type="button" role="tab" aria-controls="runs-panel" aria-selected="false">Runs</button>
+      </div>
+    </header>
 
-  start.addEventListener('click', () => change('start'));
-  stop.addEventListener('click', () => change('stop'));
-  async function refresh() {
-    if (!pending) {
-      const requestedRevision = revision;
-      try {
-        const run = await request('/api/run');
-        if (!pending && revision === requestedRevision) render(run);
-      } catch (error) {
-        byId('error').textContent = error.message;
-      }
-    }
-    setTimeout(refresh, 1000);
-  }
-  refresh();
-</script>
+    <div id="error" class="error" role="alert"></div>
+    <section class="studio-layout" id="studio">
+      <section class="stage-column" aria-label="Minecraft world">
+        <div class="playback-panel">
+          <div class="viewer" id="viewer"><div class="viewer-empty">Start a run to open the live first-person world view.</div></div>
+          <div class="playback-meta">
+            <div class="health-row" aria-label="Player health">
+              <span class="health-label">Health</span>
+              <div class="hearts" id="hearts" role="img" aria-label="Health not yet observed"></div>
+              <span class="health-value" id="health-value">— / 20</span>
+            </div>
+            <div class="health-row" aria-label="Player hunger">
+              <span class="health-label">Hunger</span>
+              <div class="foods" id="foods" role="img" aria-label="Hunger not yet observed"></div>
+              <span class="health-value" id="food-value">— / 20</span>
+            </div>
+            <div class="run-actions">
+              <span id="run-state" class="run-state">No run</span>
+              <button id="start" class="primary" disabled>Start</button>
+              <button id="stop" class="danger" hidden>Stop</button>
+            </div>
+          </div>
+          <p id="run-detail" hidden></p>
+        </div>
+        <section class="agent-under-viewer" aria-label="Agent state and task">
+          <section class="agent-card" id="agent-card" data-mode="idle" aria-label="Agent state">
+            <div class="agent-stage"><img id="steve" class="steve" src="https://skinrender.dev/render/steve/body?size=384" alt="Steve standing"></div>
+            <div class="activity-block">
+              <div class="activity-line" id="activity-line" hidden><h3 id="activity">Waiting for a run</h3></div>
+              <div class="model-controls">
+                <div id="model-slot"><span id="model-picker">GPT-6.1 Terra</span></div>
+                <span class="reasoning-control">Reasoning <output id="reasoning-value">Medium</output></span>
+              </div>
+              <div class="agent-controls">
+                <div class="auth" id="auth">
+                  <span id="service" class="connection" aria-live="polite" aria-label="ChatGPT OAuth"><span class="dot"></span>ChatGPT OAuth</span>
+                </div>
+              </div>
+            </div>
+          </section>
+          <div class="current-task" id="current-task-panel" hidden>
+            <span class="current-task-label">Spectator</span><span class="current-task-text" id="current-task"></span>
+          </div>
+          <section class="inventory-panel" aria-label="Player inventory">
+            <div class="inventory-heading"><span>Inventory</span><span id="inventory-observed">Not observed yet</span></div>
+            <div class="inventory-items" id="inventory-items" role="list" aria-live="polite"><span class="inventory-empty">Waiting for an inventory observation</span></div>
+          </section>
+        </section>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch color theme"><span id="theme-label">Dark</span><span class="switch-track"><span class="switch-dot"></span></span></button>
+      </section>
+
+      <aside class="context-column" aria-label="Conversation and saved runs">
+        <section class="trace-panel" id="trace-panel" role="tabpanel" aria-labelledby="conversation-tab" aria-label="Conversation and activity">
+          <div class="trace" id="timeline" aria-label="Conversation and activity trace" aria-live="off">
+            <button id="more" class="load-more" type="button" hidden>Load older activity</button>
+            <div id="trace-events"></div>
+            <div id="trace-empty" class="trace-empty">The run transcript will appear here.</div>
+          </div>
+          <button id="trace-bottom" class="trace-bottom" type="button" aria-label="Scroll to latest conversation activity" title="Scroll to latest activity" hidden>↓ Latest</button>
+        </section>
+        <section class="runs-panel" id="runs-panel" role="tabpanel" aria-labelledby="runs-tab" aria-label="Saved Minecraft runs" hidden>
+          <div class="runs-view" id="runs-list-view">
+            <div class="run-detail-actions"><div class="workspace-heading">Saved runs</div><button id="refresh-runs" type="button">Refresh</button></div>
+            <div class="run-library-status" id="runs-status">Loading saved runs…</div>
+            <div class="run-list" id="runs-list" aria-live="polite"></div>
+          </div>
+          <div class="runs-view" id="run-detail-view" hidden>
+            <div class="run-detail-actions"><button id="back-to-runs" type="button">← All runs</button><span id="run-detail-title" class="run-library-meta"></span></div>
+            <div class="run-detail-content" id="run-detail-content"><div class="run-library-empty">Select a run to inspect its saved summary.</div></div>
+          </div>
+        </section>
+      </aside>
+    </section>
+
+  </main>
+
+  <script type="module" src="/dashboard.mjs"></script>
+</body>
 </html>

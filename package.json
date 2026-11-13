@@ -2,8 +2,14 @@
   "name": "minecraft-mine-ai",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.15.0" },
-  "scripts": { "start": "node src/server.mjs", "test": "node --test", "check": "find src deploy test -name '*.mjs' -exec node --check {} +" },
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "check": "find src deploy test web -name \"*.mjs\" -exec node --check {} +"
+  },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@earendil-works/pi-mcp": "1.4.0",
