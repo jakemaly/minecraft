@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { Agent, fetch as socketFetch } from 'undici';
 import { openai } from '../src/pi.mjs';
 import { dashboard } from '../src/server.mjs';
+import { restoreCheckpoint } from '../src/checkpoints.mjs';
 
 const host = '127.0.0.1';
 const send = (port, path) => fetch(`http://${host}:${port}${path}`, {
@@ -65,6 +66,7 @@ export async function scriptedInference(agentDir, scenario) {
       async *[Symbol.asyncIterator]() {
         if (stage === 0) await delay(3000, undefined, { signal });
         if (stage > 0 && ['stop', 'win', 'disconnect'].includes(scenario)) await delay(90_000, undefined, { signal });
+        if (stage > 0 && scenario === 'checkpoint') await delay(420_000, undefined, { signal });
         if (stage === 1 && ['expired', 'logging'].includes(scenario)) await delay(3000, undefined, { signal });
         yield { type: 'start', partial: message };
         if (errorMessage) yield { type: 'error', reason: 'error', error: message };
@@ -103,15 +105,17 @@ export async function smokeDashboard(root, viewerPort, gamePort, scenario = 'con
 }
 
 const smokeOptions = { skip: process.env.MINECRAFT_SMOKE !== '1', timeout: 140_000 };
+const checkpointSmokeOptions = { skip: process.env.MINECRAFT_CHECKPOINT_SMOKE !== '1', timeout: 480_000 };
 
 async function attempt(scenario, verify, options) {
   const root = await mkdtemp(join(tmpdir(), 'mine-ai-'));
   const viewerPort = await sparePort();
   const gamePort = await sparePort();
-  const app = await smokeDashboard(root, viewerPort, gamePort, scenario, options);
+  const { collect, pollCount = 180, ...dashboardOptions } = options ?? {};
+  const app = await smokeDashboard(root, viewerPort, gamePort, scenario, dashboardOptions);
   const status = async () => (await fetch(`http://${host}:${app.port}/api/run`)).json();
   const waitFor = async condition => {
-    for (let n = 0; n < 180; n++) {
+    for (let n = 0; n < pollCount; n++) {
       const run = await status();
       if (condition(run)) return run;
       await delay(500);
@@ -120,10 +124,11 @@ async function attempt(scenario, verify, options) {
   };
   try {
     assert.equal((await fetch(`http://${host}:${app.port}/api/start`, { method: 'POST' })).status, 404);
-    assert.equal((await send(app.port, '/api/start')).status, 202);
+    assert.equal((await send(app.port, collect ? '/api/start?collect=1' : '/api/start')).status, 202);
     assert.equal((await send(app.port, '/api/start')).status, 409);
     const run = await waitFor(status => status.state === 'running' || status.state === 'incomplete');
     assert.equal(run.state, 'running', run.detail);
+    assert.equal(Boolean(run.collectionSession), Boolean(collect));
     const terminal = () => waitFor(status => ['won', 'incomplete', 'stopped'].includes(status.state));
     const directory = join(root, run.id);
     const consoleCommand = command => execFileSync('docker', ['exec', `mineai-${run.id}-server`,
@@ -278,3 +283,75 @@ test('activity logging failure still saves the world and reports the error', smo
     assert.equal(final.state, 'incomplete');
     assert.match(final.detail, /Could not record run activity/);
   }));
+
+test('a natural Hardcore autosave restores a playable world and survives a death retry', checkpointSmokeOptions, async () => {
+  await attempt('checkpoint', async ({ run, directory, root, waitFor, consoleCommand, app }) => {
+    await waitFor(state => state.activity.some(event => event.type === 'continuation'));
+    // Distinct fixture state makes a fallback spawn or lost inventory observable.
+    consoleCommand('difficulty peaceful');
+    consoleCommand('tp Acacia 32.5 150 -16.5 30 15');
+    consoleCommand('fill 30 149 -19 35 149 -14 minecraft:stone');
+    consoleCommand('give Acacia minecraft:diamond_pickaxe[minecraft:damage=27] 1');
+    consoleCommand('experience set Acacia 7 levels');
+    consoleCommand('experience set Acacia 4 points');
+    await waitFor(state => state.checkpoints?.captured === 1);
+    const store = join(root, 'checkpoints', run.collectionSession, run.id);
+    const indexFile = join(store, 'index.json');
+    const index = JSON.parse(await readFile(indexFile, 'utf8'));
+    const checkpoint = join(store, index.slots.recent);
+    const restore = join(root, 'replay');
+    const snapshot = await restoreCheckpoint(checkpoint, restore);
+    assert.ok(snapshot.context?.leaf);
+    assert.ok(snapshot.contextSettings.tools.some(tool => tool.name === 'mcp__minecraft__view_status'));
+    const saved = await readFile(join(restore, 'world/playerdata', `${snapshot.player}.dat`));
+    const live = await readFile(join(directory, 'server/world/playerdata', `${snapshot.player}.dat`));
+    assert.deepEqual(saved, live);
+    await writeFile(join(restore, 'eula.txt'), 'eula=true\n');
+    const jar = process.env.MINECRAFT_SERVER_JAR ?? join(root, 'server.jar');
+    const replay = `mineai-checkpoint-replay-${run.id}`;
+    const docker = (...args) => execFileSync('docker', args, { timeout: 20_000 }).toString();
+    try {
+      docker('run', '--rm', '--pull=never', '-di', '--name', replay, '--network=none',
+        '--user', `${process.getuid()}:${process.getgid()}`, '-v', `${restore}:/data:rw`,
+        '-v', `${jar}:/server.jar:ro`, '-w', '/data',
+        'eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817bbceb6b3be94109b4a784d46078099882dda',
+        'java', '-Xmx1G', '-jar', '/server.jar', 'nogui');
+      for (let attempt = 0; attempt < 60 && !docker('logs', replay).includes('Done ('); attempt++) await delay(500);
+      assert.match(docker('logs', replay), /Done \(/);
+      const replayCommand = command => docker('exec', replay, 'sh', '-c', 'printf "%s\n" "$1" > /proc/1/fd/0', 'sh', command);
+      // Join the actual replay over its private loopback using the existing Mineflayer installation.
+      const client = docker('run', '--rm', '--pull=never', `--network=container:${replay}`, '--entrypoint=bun',
+        'minecraft-mine-ai:de4fef3-primitives', '-e', `
+          import mineflayer from 'mineflayer';
+          const bot = mineflayer.createBot({ host: '127.0.0.1', username: 'Acacia', version: '1.21.4', auth: 'offline' });
+          bot.once('error', error => { console.error(error); process.exit(1); });
+          bot.once('spawn', () => setTimeout(() => {
+            console.log(JSON.stringify({
+              health: bot.health, position: [bot.entity.position.x, bot.entity.position.y, bot.entity.position.z],
+              dimension: bot.game.dimension, mode: bot.game.gameMode, xp: bot.experience.level,
+              tool: bot.inventory.items().find(item => item.name === 'diamond_pickaxe')?.durabilityUsed,
+            }));
+            bot.quit(); process.exit(0);
+          }, 500));
+        `);
+      const player = JSON.parse(client.trim().split('\n').at(-1));
+      assert.deepEqual(player, { health: 20, position: [32.5, 150, -16.5],
+        dimension: 'overworld', mode: 'survival', xp: 7, tool: 27 });
+      replayCommand('stop');
+    } finally {
+      try { docker('rm', '-f', replay); } catch {}
+    }
+    consoleCommand('damage Acacia 12 minecraft:generic');
+    await waitFor(state => state.checkpoints?.incidents === 1);
+    consoleCommand('kill Acacia');
+    const next = await waitFor(state => state.id !== run.id && state.state === 'running');
+    assert.equal(next.collectionSession, run.collectionSession);
+    assert.deepEqual(next.profile, run.profile);
+    const retained = JSON.parse(await readFile(indexFile, 'utf8'));
+    assert.equal(retained.incidents.length, 1);
+    assert.equal(retained.incidents[0].outcome, 'death');
+    assert.equal(retained.incidents[0].slots.recent, index.slots.recent);
+    assert.equal((await send(app.port, '/api/stop')).status, 202);
+  }, { hardcore: true, collect: true, pollCount: 760, reflect: async () => ({ category: 'decision',
+    summary: 'Synthetic death', evidence: [], uncertainty: '', reviewQuestion: '' }) });
+});

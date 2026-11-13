@@ -6,9 +6,10 @@ import { connect, createServer } from 'node:net';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import { Agent, fetch } from 'undici';
 import { play, modelId, thinkingLevel } from './pi.mjs';
+import { createCheckpointCollector } from './checkpoints.mjs';
 import { defaultPrimitives, minePolicy, recordedDeath } from './primitives.mjs';
 
 const docker = promisify(execFile).bind(null, 'docker');
@@ -94,6 +95,9 @@ export function startRun(config) {
   const abort = new AbortController();
   const { signal } = abort;
   const operatorStop = new Error('Stopped by operator.');
+  const collector = config.collection && createCheckpointCollector({
+    root: config.root, run: directory, id, session: config.collection.id, collection: config.collection, bot,
+  });
   let error;
   const fail = failure => {
     error ??= failure.message;
@@ -101,6 +105,8 @@ export function startRun(config) {
   };
   const run = {
     id, seed, hardcore, profile, parent: config.parent, state: 'starting', activity: [], detail: null,
+    collectionSession: config.collection?.id,
+    checkpointStatus: collector?.status,
     viewer: `http://${config.host}:${config.viewerPort}/`, spectator: `${config.host}:${config.gamePort}`,
     stop(reason = operatorStop) {
       if (!signal.aborted) abort.abort(reason);
@@ -140,15 +146,21 @@ export function startRun(config) {
       await mkdir(directory, { mode: 0o700 });
       await Promise.all([world, data, sockets].map(path => mkdir(path, { mode: 0o700 })));
       if (Buffer.byteLength(join(sockets, 'viewer.sock')) >= 108) throw new Error('Run directory is too long for Unix sockets.');
-      const inspected = await docker(['image', 'inspect', mineImage], { timeout: 10_000 });
+      const promptText = await readFile(prompt, 'utf8');
+      const inspected = await docker(['image', 'inspect', config.collection?.runtime?.image ?? mineImage], { timeout: 10_000 });
       const [image] = JSON.parse(inspected.stdout);
       if (image.Config.Labels?.['org.opencontainers.image.revision'] !== revision) {
         throw new Error('The Mine AI image does not match the pinned source revision.');
       }
+      const runtime = { image: image.Id, jarHash, promptSha256: createHash('sha256').update(promptText).digest('hex'),
+        hardcore, profile, model: modelId, thinkingLevel };
+      if (config.collection?.runtime && !isDeepStrictEqual(config.collection.runtime, runtime)) {
+        throw new Error('The current Minecraft runtime differs from this collection session.');
+      }
+      if (config.collection) config.collection.runtime = runtime;
       await writeFile(join(directory, 'run.json.tmp'), JSON.stringify({
-        id, seed, bot, version: '1.21.4', jarHash, revision, model: modelId, thinkingLevel,
-        hardcore, profile, parent: config.parent,
-        image: image.Id, promptSha256: createHash('sha256').update(await readFile(prompt)).digest('hex'),
+        id, seed, bot, version: '1.21.4', revision, ...runtime,
+        parent: config.parent, collectionSession: config.collection?.id,
       }, null, 2));
       await rename(join(directory, 'run.json.tmp'), join(directory, 'run.json'));
       hasManifest = true;
@@ -206,15 +218,20 @@ export function startRun(config) {
           dispatcher, signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
         });
         const status = await response.json();
-        if (status.minecraft?.username === bot && hardcore && status.minecraft.lastDeath && !death) {
+        if (status.minecraft?.username === bot && (hardcore || collector) && status.minecraft.lastDeath && status.minecraft.lastDeath.observedAt !== death?.observedAt) {
           death = status.minecraft.lastDeath;
           record('death', { death });
-          finish(death.cause);
-          abort.abort();
+          if (hardcore) {
+            finish(death.cause);
+            abort.abort();
+          } else {
+            void collector.death(death);
+          }
         }
         if (!status.ok || !status.minecraft?.connected || status.minecraft.username !== bot) return null;
         const { health, food, inventory, gamemode } = status.minecraft;
         run.player = { health, food, inventory };
+        if (run.state === 'running' && gamemode === 'survival') void collector?.sample(status.minecraft);
         return { gamemode };
       };
       try {
@@ -224,7 +241,7 @@ export function startRun(config) {
         forwards.push(await forward(config.host, config.gamePort, join(directory, 'game.sock'), config.allowed));
         signal.throwIfAborted();
         run.state = 'running';
-        agent = play({ directory, socket: mcp, agentDir: config.agentDir, signal, record, prompt, actionWaitMs: hardcore ? profile.actionWaitMs : undefined, inference: config.inference });
+        agent = play({ directory, socket: mcp, agentDir: config.agentDir, signal, record, prompt, promptText: config.collection && promptText, collectContext: Boolean(collector), actionWaitMs: hardcore ? profile.actionWaitMs : undefined, inference: config.inference });
         const watchdog = async () => {
           let failures = 0;
           while (!signal.aborted) {
@@ -244,6 +261,7 @@ export function startRun(config) {
     } finally {
       stopped ||= signal.reason === operatorStop;
       run.state = 'saving';
+      collector?.stop();
       abort.abort();
       forwards.forEach(close => close());
       if (agent) {
@@ -272,7 +290,8 @@ export function startRun(config) {
           error ??= `Could not read death evidence: ${failure.message}`;
         }
       }
-      const state = proof ? 'won' : stopped ? 'stopped' : death ? 'dead' : 'incomplete';
+      await collector?.finish(hardcore ? death : undefined);
+      const state = proof ? 'won' : stopped ? 'stopped' : hardcore && death ? 'dead' : 'incomplete';
       const detail = proof ?? (state === 'dead' ? death.cause ?? 'Minecraft recorded Acacia’s death.'
         : stopped ? operatorStop.message : error ?? run.detail ?? 'Attempt ended before a verified outcome.');
       if (hasManifest) {

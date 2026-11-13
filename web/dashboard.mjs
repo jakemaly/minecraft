@@ -108,6 +108,14 @@ function renderInventory(items) {
 function renderStatus() {
   const active = ['starting', 'running', 'saving', 'reflecting'].includes(run.state);
   $('start').disabled = !run.state || active || controlPending;
+  $('checkpoint-control').hidden = active;
+  $('collect-checkpoints').disabled = $('start').disabled;
+  const checkpoints = run.checkpoints;
+  const checkpointStatus = $('checkpoint-status');
+  checkpointStatus.hidden = !active || !checkpoints;
+  checkpointStatus.textContent = checkpoints?.state === 'full' ? 'Checkpoint collection paused at the storage limit.'
+    : checkpoints?.state === 'error' ? `Checkpoint capture failed. ${checkpoints.error}`
+    : checkpoints ? `Checkpoints collected: ${checkpoints.captured}` : '';
   $('stop').hidden = !active;
   $('stop').disabled = run.state === 'saving' || controlPending;
   $('run-state').textContent = run.state === 'won' ? 'Dragon defeated' : run.id ? title(run.state) : 'No run';
@@ -234,7 +242,9 @@ async function control(action) {
   controlPending = true;
   renderStatus();
   try {
-    const status = await api(`/api/${action}`, { method: 'POST' });
+    const collect = action === 'start' && $('collect-checkpoints').checked;
+    const status = await api(`/api/${action}${collect ? '?collect=1' : ''}`, { method: 'POST' });
+    if (action === 'start') $('collect-checkpoints').checked = false;
     if (status.id !== run.id) {
       messages.clear();
       before = null;

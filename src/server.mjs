@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createServer as createSocket } from 'node:net';
 import { mkdir, readFile, realpath } from 'node:fs/promises';
@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { dragonAdvancement, recoverRuns, startRun } from './run.mjs';
 import { conversation, runId, savedRuns } from './history.mjs';
 import { modelId, thinkingLevel } from './pi.mjs';
+import { recoverCheckpoints } from './checkpoints.mjs';
 import { deathReview, readReflection, recordedDeath, reflectDeath, writeReflection } from './primitives.mjs';
 
 export async function dashboard({ host, port, root, agentDir, viewerPort, gamePort, allowed, jar, inference, hardcore = false, reflect = reflectDeath }) {
@@ -18,18 +19,20 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
     ['/assets/dark-theme-enabled.svg', 'assets/dark-theme-enabled.svg', 'image/svg+xml'],
   ].map(async ([route, file, type]) => [route, { body: await readFile(new URL(`../web/${file}`, import.meta.url)), type }])));
   let run;
+  let collection;
   let review;
   let closing = false;
   const status = () => run ? {
     id: run.id, state: run.state, detail: run.detail, hardcore: run.hardcore, profile: run.profile, parent: run.parent, death: run.death, activity: run.activity ?? [], player: run.player,
-    model: modelId, thinkingLevel,
+    model: modelId, thinkingLevel, collectionSession: run.collectionSession, checkpoints: run.checkpointStatus?.(),
     viewer: run.state === 'running' ? run.viewer : null,
     spectator: run.state === 'running' ? run.spectator : null,
   } : { state: 'idle', activity: [], model: modelId, thinkingLevel };
   const active = () => Boolean(review) || ['starting', 'running', 'saving'].includes(run?.state);
 
-  function begin(parent) {
-    const started = startRun({ ...config, parent });
+  function begin(parent, collect = false) {
+    if (!parent) collection = collect ? { id: randomUUID().replaceAll('-', '').slice(0, 12) } : undefined;
+    const started = startRun({ ...config, parent, collection });
     run = started;
     started.done.then(() => {
       if (started.state === 'dead' && started.hardcore && !closing) schedule(started);
@@ -114,10 +117,10 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
       }
     }
     if (request.method === 'POST' && request.headers.origin === origin) {
-      if (request.url === '/api/start') {
+      if (request.url === '/api/start' || request.url === '/api/start?collect=1') {
         if (closing || active()) return json(409, { error: 'A run is already active.' });
         if (hardcore && run?.state === 'won') return json(409, { error: 'The Dragon has already been defeated.' });
-        begin();
+        begin(undefined, request.url.endsWith('?collect=1'));
         return json(202, status());
       }
       if (request.url === '/api/stop') {
@@ -172,10 +175,14 @@ export async function dashboard({ host, port, root, agentDir, viewerPort, gamePo
         if (death) Object.assign(run, { state: 'dead', death, detail: death.cause ?? 'Minecraft recorded Acacia’s death.' });
       }
     }
+    await recoverCheckpoints(config.root, run).catch(error => {
+      console.error(`Could not recover checkpoints: ${error.message}`);
+    });
     const resumeReview = hardcore && run?.hardcore && run.state === 'dead' &&
       !(await readReflection(join(config.root, run.id)))?.stopped;
     await new Promise((ready, reject) => server.once('error', reject).listen(port, host, ready));
     if (resumeReview) {
+      if (run.collectionSession) collection = { id: run.collectionSession, runtime: run.runtime };
       schedule(run);
     }
   } catch (error) {

@@ -27,9 +27,27 @@ Set `MINECRAFT_HARDCORE=1` before launching the dashboard or in the service envi
 
 The dashboard owns death retries. The overseer still handles infrastructure interruptions. Use the dashboard Stop control to end the loop. A verified Dragon kill ends the loop automatically.
 
+## Checkpoint collection
+
+To opt in, select **Collect checkpoints** in the dashboard before pressing **Start**. You can also start a collection session through the API. Fresh worlds launched automatically after Hardcore deaths inherit the session ID and baseline settings.
+
+```sh
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:2718' 'http://127.0.0.1:2718/api/start?collect=1'
+```
+
+Collection requires GNU tar, zstd, nice, and ionice on the dashboard host. The collector observes vanilla autosaves during play and tries a background copy of the on-disk world. It skips danger and copies that change while being read. The two rolling slots hold the latest accepted save and an older save from a calm stretch. An observed drop to half health or a death retains the available pre-danger copies for that incident. A sustained recovery starts a new incident. Capture pauses at a shared 2 GiB disk cap and gameplay continues.
+
+Find collection indexes at `$MINECRAFT_RUNS/checkpoints/SESSION/RUN/index.json`. Each index records accepted and skipped saves the interval between observed autosaves, and the age of retained checkpoints at the first observed danger. Each retained checkpoint contains the world and can include a bounded Pi transcript. The transcript ends at a completed decision boundary at or before the player save and can precede the world by the age recorded in its metadata.
+
+```sh
+node src/checkpoints.mjs restore "$MINECRAFT_RUNS/checkpoints/SESSION/RUN/CHECKPOINT" /path/to/new-replay-directory
+```
+
+To play the restored world locally, start the pinned 1.21.4 server JAR from the replay directory after accepting the Minecraft EULA there. The restore binds to loopback and preserves the saved game mode when the original offline player name rejoins. It loads serialized world and player state. Pending actions, transient simulation state, and exact tick replay are outside that format.
+
 ## Verify
 
-Run `npm run check` and `npm test`. After building the image, run `MINECRAFT_SMOKE=1 node --test test/smoke.test.mjs` for the Docker and Pi integration tests, including a forced Hardcore death and fresh-world restart.
+Run `npm run check` and `npm test`. After building the image, run `MINECRAFT_SMOKE=1 node --test test/smoke.test.mjs` for the Docker and Pi integration tests, including a forced Hardcore death and fresh-world restart. Run `MINECRAFT_CHECKPOINT_SMOKE=1 node --test --test-name-pattern='natural Hardcore autosave' test/smoke.test.mjs` to verify collection and replay across a natural autosave.
 
 ## Overseer
 

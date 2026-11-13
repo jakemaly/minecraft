@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
@@ -32,7 +32,7 @@ export async function openai(agentDir) {
   return { runtime, model };
 }
 
-export async function play({ directory, socket, agentDir, signal, record, prompt: promptFile = new URL('../deploy/prompt.txt', import.meta.url), actionWaitMs, inference = openai }) {
+export async function play({ directory, socket, agentDir, signal, record, prompt: promptFile = new URL('../deploy/prompt.txt', import.meta.url), promptText, collectContext = false, actionWaitMs, inference = openai }) {
   const { runtime, model } = await inference(agentDir);
   const dispatcher = new Agent({ connect: { socketPath: socket } });
   let client;
@@ -115,6 +115,15 @@ export async function play({ directory, socket, agentDir, signal, record, prompt
       throw new Error('Pi did not activate the exact Mine AI tool catalogue.');
     }
     record('catalogue', { tools: catalogue, model: model.id, contextWindow: model.contextWindow });
+    if (collectContext) {
+      const path = join(directory, 'checkpoint-context.json');
+      // Capture the effective prompt and schemas without adding messages to Pi.
+      void writeFile(`${path}.tmp`, JSON.stringify({
+        systemPrompt: session.systemPrompt, tools: tools.map(({ execute, ...schema }) => schema),
+      }), { mode: 0o600 }).then(() => rename(`${path}.tmp`, path)).catch(error => {
+        console.error(`Could not record checkpoint context: ${error.message}`);
+      });
+    }
     session.subscribe(event => {
       if (event.type === 'tool_execution_start' || event.type === 'tool_execution_end') {
         const response = event.result?.details?.structuredContent?.response;
@@ -133,7 +142,7 @@ export async function play({ directory, socket, agentDir, signal, record, prompt
     });
     signal.addEventListener('abort', stop, { once: true });
     signal.throwIfAborted();
-    let prompt = await readFile(promptFile, 'utf8');
+    let prompt = promptText ?? await readFile(promptFile, 'utf8');
     for (;;) {
       signal.throwIfAborted();
       lastReply = undefined;
