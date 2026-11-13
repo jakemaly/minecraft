@@ -11,7 +11,7 @@ Use Linux, Node 24.15+, and Docker Engine 28+ with isolated bridge support. Acce
 ```sh
 npm ci
 docker pull eclipse-temurin:21-jre@sha256:a80c51f2d09a3e7e00d521f1c817bbceb6b3be94109b4a784d46078099882dda
-docker build -f deploy/Dockerfile -t minecraft-mine-ai:de4fef3-build-progress .
+docker build -f deploy/Dockerfile -t minecraft-mine-ai:de4fef3-search-budget .
 npm start
 ```
 
