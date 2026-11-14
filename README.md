@@ -1,6 +1,5 @@
 # Acacia: Self-Improving Minecraft Agent
 Acacia empowers large language models (LLMs) to embody a stateful player in digital environment, and to take actions within it.
-To public knowledge, Acacia is the **world's first agent to beat Minecraft on Hard mode** for a random seed and no human-authored templates.
 
 ## Intro
 <img width="1332" height="852" alt="image" src="https://github.com/user-attachments/assets/a1fa1594-3d81-4fe1-8e75-560a4f1c3c1e" />
