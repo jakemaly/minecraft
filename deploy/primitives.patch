@@ -1,0 +1,410 @@
+diff --git a/src/actions/drop-item/contract.ts b/src/actions/drop-item/contract.ts
+index 0097b01..9aeae0f 100644
+--- a/src/actions/drop-item/contract.ts
++++ b/src/actions/drop-item/contract.ts
+@@ -39,9 +39,10 @@ export const dropItemInputSchema = z
+       .describe("Items to drop, in order."),
+     to_player: z
+       .string()
+-      .min(1)
++      .trim()
+       .max(32)
+       .optional()
++      .transform((name) => name || undefined)
+       .describe(
+         "Player to hand the items to. The bot walks within reach of them, faces them, and tosses. Omitted, the items are " +
+           "dropped where the bot already stands.",
+diff --git a/src/actions/drop-item/drop-item.test.ts b/src/actions/drop-item/drop-item.test.ts
+index 0956ca7..dd742f8 100644
+--- a/src/actions/drop-item/drop-item.test.ts
++++ b/src/actions/drop-item/drop-item.test.ts
+@@ -242,6 +242,19 @@ test("a toss the server swallows or rejects is reported, not assumed", async ()
+   assert.match(rejected.drop.dropped[0]?.error ?? "", /\[DROP_REJECTED\].*server refused/);
+ });
+ 
++test("a blank optional recipient disposes of the stack at the current position", async () => {
++  const { bot } = dropBot({ carried: [{ name: "gravel", count: 4, type: 1 }] });
++  const result = await dropItem(
++    bot,
++    parseDropItemRequest({ items: [{ item_name: "gravel" }], to_player: " " }),
++    {},
++    deps({ navigate: async () => { throw new Error("No handover was requested."); } }),
++    createDiscardedItems(),
++  );
++  assert.equal(result.status, "succeeded");
++  assert.equal(result.drop.dropped[0]?.dropped, 4);
++});
++
+ test("walks to the named player, faces them, and records the handover", async () => {
+   const { bot, lookedAt } = dropBot({
+     carried: [{ name: "bread", count: 8, type: 1 }],
+diff --git a/src/navigation/processes/mining/mine-process.test.ts b/src/navigation/processes/mining/mine-process.test.ts
+index 4e39107..9e30bba 100644
+--- a/src/navigation/processes/mining/mine-process.test.ts
++++ b/src/navigation/processes/mining/mine-process.test.ts
+@@ -230,6 +230,30 @@ test("nearby drops are recovered before another source is offered for mining", a
+   assert.equal(result.status, "satisfied");
+ });
+ 
++test("an exact collection mines the named block before chasing matching loose drops", async () => {
++  const target = new Vec3(1, 64, 0);
++  const bot = fakeBot({ blocks: [target], drops: [new Vec3(8, 64, 0)], feet: new Vec3(0.5, 64, 0.5) });
++  let broken = false;
++  let pickedUp = false;
++  const result = await mine(bot, request(bot, {
++    exactTarget: target,
++    canMine: () => ({ kind: "mineable", routeMayBreak: false }),
++    isSatisfied: () => pickedUp,
++    breakInPlace: async () => {
++      broken = true;
++      (bot as FakeWorld).removeBlock(target);
++      return { status: "broken" };
++    },
++    route: async () => {
++      assert.equal(broken, true, "the named block must come first");
++      pickedUp = true;
++      return { status: "completed", elapsedMs: 0 };
++    },
++  }));
++  assert.equal(result.status, "satisfied");
++  assert.deepEqual(result.broken, [target]);
++});
++
+ test("an exploratory run keeps one branch point and rewards outward progress at its Y level", async () => {
+   const bot = fakeBot({ feet: new Vec3(0.5, 64, 0.5) });
+   let satisfied = false;
+diff --git a/src/navigation/processes/mining/mine-process.ts b/src/navigation/processes/mining/mine-process.ts
+index efcd790..e98144d 100644
+--- a/src/navigation/processes/mining/mine-process.ts
++++ b/src/navigation/processes/mining/mine-process.ts
+@@ -362,7 +362,7 @@ function scan(bot: Bot, request: MineRequest, blacklist: MineBlacklist): MineSca
+     .map((entity) => ({ position: entity.position.floored(), kind: "drop" as const, entityId: entity.id }));
+ 
+   const seen = new Set<string>();
+-  const targets = [...drops, ...blocks]
++  const targets = [...(request.exactTarget && blocks.length > 0 ? [] : drops), ...blocks]
+     .filter((target) => {
+       const identity = targetIdentity(target);
+       if (seen.has(identity)) return false;
+@@ -851,7 +851,9 @@ class MineTargeting {
+     // in a netherrack bank otherwise keep winning at the current stance until
+     // the break budget is exhausted, with the requested items still on ledges.
+     // Keep known blocks above so route excavation remains part of the evidence.
+-    if (this.#targets.some(isDropTarget)) this.#targets = this.#targets.filter(isDropTarget);
++    const exactBlockPending = this.request.exactTarget !== undefined && this.broken.length === 0;
++    if (exactBlockPending) this.#targets = this.#targets.filter((target) => !isDropTarget(target));
++    else if (this.#targets.some(isDropTarget)) this.#targets = this.#targets.filter(isDropTarget);
+     if (this.#water.kind === "pending") {
+       if (carriesWaterBucket(this.bot)) this.#water = { kind: "none" };
+       else if (!isLiquidSource(this.bot, this.bot.blockAt(asVec3(this.#water.target.position)), "water")) {
+diff --git a/src/runtime/minecraft-runtime.test.ts b/src/runtime/minecraft-runtime.test.ts
+index 608c1ba..0a71bb4 100644
+--- a/src/runtime/minecraft-runtime.test.ts
++++ b/src/runtime/minecraft-runtime.test.ts
+@@ -379,6 +379,7 @@ test("the Minecraft runtime owns frontier attachment and its action catalog", as
+   assert.deepEqual(survival.policy, survivalPolicy);
+   assert.deepEqual(runtimeStatus, {
+     foreground: { active: null, awaitingResult: null, storageError: null },
++    lastDeath: null,
+     combat: null,
+     busy: false,
+     activeAction: null,
+@@ -524,6 +525,7 @@ test("death cancels the foreground action, records one event, and permits work a
+   });
+   assert.equal(runtime.status().busy, false);
+ 
++  assert.deepEqual(runtime.status().lastDeath?.position, { x: 12.5, y: 64, z: -3.25 });
+   const events = await runtime.run(readEventsAction, {});
+   const eventPage = readRecentEventsResultSchema.parse(events.result);
+   assert.equal(eventPage.status, "succeeded");
+diff --git a/src/runtime/minecraft-runtime.ts b/src/runtime/minecraft-runtime.ts
+index b85790d..29695f0 100644
+--- a/src/runtime/minecraft-runtime.ts
++++ b/src/runtime/minecraft-runtime.ts
+@@ -16,6 +16,7 @@ import {
+   installActionQueryCatalog,
+   installMinecraftKnowledge,
+   readNotificationSummary,
++  readLastDeath,
+   recordActionRequest,
+   recordActionResponse,
+   SqlBotData,
+@@ -83,6 +84,7 @@ type RuntimeRun = <Name extends string, Request, Result extends ActionResult>(
+ 
+ export interface MinecraftRuntimeStatus extends ActionRunnerStatus {
+   readonly foreground: ReturnType<AsyncActions["status"]>;
++  readonly lastDeath: ReturnType<typeof readLastDeath>;
+   readonly survival: SurvivalStatus;
+   readonly combat: { targetId: number; execution: ReturnType<CombatController["execution"]> } | null;
+   readonly survivalPolicy: import("../survival/policy/contract.js").PolicySnapshot;
+@@ -256,6 +258,7 @@ class AttachedMinecraftRuntime implements MinecraftRuntime {
+     return {
+       ...this.#runner.status(),
+       foreground: this.asyncActions.status(),
++      lastDeath: readLastDeath(this.#botData, this.#bot.username),
+       survival: this.survival.snapshot(),
+       combat: this.combat.activeEngagement()
+         ? { targetId: this.combat.activeEngagement()!.targetId, execution: this.combat.execution() }
+diff --git a/src/survival/policy/combat/decision.ts b/src/survival/policy/combat/decision.ts
+index d3cfd62..674ae9c 100644
+--- a/src/survival/policy/combat/decision.ts
++++ b/src/survival/policy/combat/decision.ts
+@@ -159,7 +159,16 @@ export function decideCombatResponse(facts: CombatDecisionFacts, purpose: Combat
+ 
+   if (facts.fireball && policy.melee && !answered.has("deflect"))
+     return { kind: "deflect", targetId: facts.fireball.id, reason: "incoming_fireball", threats: [facts.fireball] };
+-  if (purpose.kind === "contact_defence" && fightAnswered(purpose.targetId)) return evade("unreachable");
++  if (purpose.kind === "contact_defence") {
++    // An in-flight fight owns the body. Reconsider here so the outer reflex
++    // does not have to wait for the fight to release control on its own.
++    if (needsCombatRecovery(health, policy.critical_health) && threats.length > 0) {
++      if (hideAvailable && !answered.has("recovery") && policy.recover !== "never" && facts.recoveryAvailable)
++        return { kind: "hide", threats, reason: "hurt" };
++      if (policy.retreat && !answered.has("evade")) return evade("hurt");
++    }
++    if (fightAnswered(purpose.targetId)) return evade("unreachable");
++  }
+   if (purpose.kind === "contact_defence")
+     return policy.melee || policy.bow || (policy.shield && facts.shield)
+       ? { kind: "fight", targetId: purpose.targetId, threats }
+diff --git a/src/survival/policy/combat/fight-boundary.test.ts b/src/survival/policy/combat/fight-boundary.test.ts
+index 0a77936..5f8046e 100644
+--- a/src/survival/policy/combat/fight-boundary.test.ts
++++ b/src/survival/policy/combat/fight-boundary.test.ts
+@@ -33,6 +33,30 @@ test("the shared boundary recovers through the current refuge without reconstruc
+   assert.equal(decideFightBoundary({ ...facts(), answered: new Set(["recovery"]) }, purpose, refuge).kind, "respond");
+ });
+ 
++test("wounded contact defence reuses cover or leaves the fight to recover", () => {
++  const defence = { kind: "contact_defence", targetId: 7 } as const;
++  for (const threat of ["skeleton", "blaze"]) {
++    const observed: CombatDecisionFacts = {
++      ...facts(),
++      health: 5,
++      contacts: [{
++        id: 7, name: threat, position: { x: 4, y: 64, z: 0 }, distance: 4,
++        relationship: { avoid: true, defend: true, attention: "observed_attack" },
++        inContact: true, inReach: false, defendsOnContact: true, ranged: true,
++        utility: { inReach: false, visible: true, hasHitUs: true, safeDropGround: true, distance: 4 },
++      }],
++    };
++    assert.deepEqual(decideFightBoundary(observed, defence, refuge), { kind: "recover", health: 18 });
++    const exposed = { ...refuge, returnable: false };
++    const response = decideFightBoundary(observed, defence, exposed);
++    assert.equal(response.kind === "respond" && response.response.kind, "hide");
++    const noCover = { ...observed, hideAllowed: false };
++    const withdrawal = decideFightBoundary(noCover, defence, exposed);
++    assert.equal(withdrawal.kind === "respond" && withdrawal.response.kind, "evade");
++    assert.equal(decideFightBoundary({ ...observed, health: 20 }, defence, exposed).kind, "fight");
++  }
++});
++
+ test("policy health changes affect both pursuit admission and recovery inside cover", () => {
+   const changed = { ...facts(), policy: { ...DEFAULT_COMBAT_POLICY, engage_min_health: 8, recover_to_health: 16 } };
+   assert.equal(decideFightBoundary(changed, { ...purpose, minimumHealth: 8 }, refuge).kind, "fight");
+diff --git a/src/survival/policy/combat/fight-boundary.ts b/src/survival/policy/combat/fight-boundary.ts
+index e4fb507..07572f4 100644
+--- a/src/survival/policy/combat/fight-boundary.ts
++++ b/src/survival/policy/combat/fight-boundary.ts
+@@ -24,7 +24,7 @@ export function decideFightBoundary(
+ ): FightBoundaryDecision {
+   const response = decideCombatResponse(facts, purpose);
+   if (response.kind === "deflect") return { kind: "respond", response };
+-  const minimumHealth = purpose.kind === "pursuit" ? purpose.minimumHealth : 0;
++  const minimumHealth = purpose.kind === "pursuit" ? purpose.minimumHealth : facts.policy.critical_health;
+   const hurt = needsCombatRecovery(facts.health, minimumHealth);
+   const needsFood = protection.atProtection && protection.foodLow && protection.foodAvailable;
+   if (
+diff --git a/src/survival/positioning/combat/hostile-field.test.ts b/src/survival/positioning/combat/hostile-field.test.ts
+index 7f39635..3e0eefa 100644
+--- a/src/survival/positioning/combat/hostile-field.test.ts
++++ b/src/survival/positioning/combat/hostile-field.test.ts
+@@ -25,6 +25,7 @@ interface Mob {
+   /** minecraft-data category; defaults to a hostile. */
+   readonly kind?: string;
+   readonly metadata?: readonly unknown[];
++  readonly heldItem?: { readonly name: string };
+ }
+ 
+ interface BotOptions {
+@@ -54,6 +55,7 @@ function botWith(mobs: readonly Mob[], options: BotOptions = {}): Bot {
+           kind: "kind" in mob ? mob.kind : "Hostile mobs",
+           isValid: true,
+           metadata: mob.metadata ?? [],
++          heldItem: mob.heldItem,
+           position: new Vec3(mob.x, mob.y ?? 0, mob.z ?? 0),
+           width: 0.6,
+           height: 1.95,
+@@ -97,6 +99,23 @@ test("an admitted evade keeps proximity costs without repricing its escape as a
+   assert.notEqual(escaping?.fingerprint, ordinary?.fingerprint);
+ });
+ 
++test("withdrawal favors cover from shooters without pricing it like a new hide", () => {
++  const wall = (from: Vec3, direction: Vec3, range: number) => {
++    const to = from.plus(direction.scaled(range));
++    return from.x < 4.5 !== to.x < 4.5 ? { position: { x: 4, y: 0, z: 0 } } : null;
++  };
++  for (const name of ["skeleton", "blaze"]) {
++    const mob = { id: 7, name, x: 10, heldItem: name === "skeleton" ? { name: "bow" } : undefined };
++    const bot = botWith([mob], { health: 7, raycast: wall });
++    const retreat = createHostileStepFieldProvider(bot, context(), () => "evade", () => DEFAULT_NAVIGATION_POLICY)()!;
++    const normal = fieldFor([mob], context(), { raycast: wall })!;
++    assert.equal(retreat.costAt(3, 0, 0), normal.costAt(3, 0, 0));
++    const exposure = retreat.costAt(6, 0, 0) - normal.costAt(6, 0, 0);
++    assert.ok(exposure > 0 && exposure < HIDE_EXPOSURE_PENALTY);
++    assert.notEqual(retreat.fingerprint, normal.fingerprint);
++  }
++});
++
+ test("a hostile's cost falls off linearly to nothing at its radius", () => {
+   // A zombie: eight blocks of reach, twenty ticks at its own cell. Twenty ticks
+   // is five sprinting blocks, so standing on it is worth a five-block detour.
+diff --git a/src/survival/positioning/combat/hostile-field.ts b/src/survival/positioning/combat/hostile-field.ts
+index 765c486..964a599 100644
+--- a/src/survival/positioning/combat/hostile-field.ts
++++ b/src/survival/positioning/combat/hostile-field.ts
+@@ -20,6 +20,7 @@ import { packKey, TERRAIN_BREAK_PENALTY, type StepField, type StepFieldProvider
+ import { observedEyeHeight, type BlockRaycaster } from "../../../world/block-visibility.js";
+ import { entityDimensions } from "../../../world/entity-dimensions.js";
+ import { exposedBodyFrom, type EntityBody } from "../../../world/entity-geometry.js";
++import { isRangedAttacker } from "../../perception/combat/observations.js";
+ import type { HostileContext } from "../../control/combat/context.js";
+ import {
+   HOSTILE_CONTACT_RANGE,
+@@ -188,6 +189,7 @@ interface FieldThreat {
+   readonly penalty: number;
+   /** Whether this one raises the proximity cap for the cells it reaches. */
+   readonly severe: boolean;
++  readonly ranged: boolean;
+   readonly body: EntityBody;
+ }
+ 
+@@ -196,6 +198,7 @@ interface Sight {
+   readonly world: BlockRaycaster;
+   /** The bot's own eye height, which is where a standing body sees from. */
+   readonly eyeHeight: number;
++  readonly mode: "hide" | "retreat";
+ }
+ 
+ /**
+@@ -280,11 +283,13 @@ function fieldOver(threats: readonly FieldThreat[], sight: Sight | null, multipl
+     if (exposed === undefined) {
+       const world = beyondBody(from.world, x, y, z);
+       exposed = threats.some((threat) => {
++        if (from.mode === "retreat" && !threat.ranged) return false;
+         const dx = x - threat.x;
+         const dy = y - threat.y;
+         const dz = z - threat.z;
++        const radius = from.mode === "retreat" ? threat.radius : HOSTILE_OBSERVATION_RANGE;
+         return (
+-          dx * dx + dy * dy + dz * dz < HOSTILE_OBSERVATION_RANGE * HOSTILE_OBSERVATION_RANGE &&
++          dx * dx + dy * dy + dz * dz < radius * radius &&
+           EYE_SAMPLES.some(([ox, oz]) =>
+             exposedBodyFrom(world, new Vec3(x + ox, y + from.eyeHeight, z + oz), threat.body),
+           )
+@@ -319,15 +324,18 @@ function fieldOver(threats: readonly FieldThreat[], sight: Sight | null, multipl
+       const proximity = Math.min(total, cap) * multiplier;
+       // Exposure sits outside the proximity cap: the cap exists because
+       // proximity cannot test sight, and this term does.
+-      return sight && exposedAt(x, y, z, sight) ? proximity + HIDE_EXPOSURE_PENALTY : proximity;
++      if (!sight || !exposedAt(x, y, z, sight)) return proximity;
++      // An exposed escape still has value. Price cover without allowing it to
++      // outweigh forward progress as heavily as a predicted hide interruption.
++      return proximity + (sight.mode === "retreat" ? TERRAIN_BREAK_PENALTY : HIDE_EXPOSURE_PENALTY);
+     },
+     // Which hostiles, and which blocks they stand in. Positions are rounded to
+     // blocks because the cost is, so a mob shuffling inside one cell does not
+     // invent a new search out of a field that answers identically. Whether
+     // sight is priced and the policy multiplier are part of the identity too.
+     fingerprint:
+-      threats.map((threat) => `${threat.id}@${threat.x},${threat.y},${threat.z}`).join(";") +
+-      `|avoidance:${multiplier}` + (sight ? "|sight" : ""),
++      threats.map((threat) => `${threat.id}@${threat.x},${threat.y},${threat.z}${threat.ranged ? "r" : ""}`).join(";") +
++      `|avoidance:${multiplier}` + (sight ? `|${sight.mode}` : ""),
+   };
+ }
+ 
+@@ -361,6 +369,7 @@ export function createHostileStepFieldProvider(
+         radius: avoidance.radius,
+         penalty: avoidance.penalty,
+         severe: avoidance.severe === true,
++        ranged: isRangedAttacker(entity),
+         body: { position: entity.position.clone(), ...entityDimensions(bot, entity) },
+       });
+     }
+@@ -368,13 +377,11 @@ export function createHostileStepFieldProvider(
+     // Sorted so the fingerprint says what the field is, not what order the
+     // entity table happened to be in.
+     threats.sort((left, right) => left.id - right.id);
+-    // Exposure predicts a new hide interrupting ordinary navigation. An
+-    // admitted response already owns that decision: an escape must not stop
+-    // to excavate concealment just because health drops while separating.
+-    const sight: Sight | null =
+-      activeResponse() === null && bot.health < context.policy.critical_health
+-        ? { world: bot.world, eyeHeight: observedEyeHeight(bot.entity) }
+-        : null;
++    const response = activeResponse();
++    const wounded = bot.health < context.policy.critical_health;
++    const mode = response === null && wounded ? "hide"
++      : response === "evade" && threats.some((threat) => threat.ranged) ? "retreat" : null;
++    const sight: Sight | null = mode ? { world: bot.world, eyeHeight: observedEyeHeight(bot.entity), mode } : null;
+     return fieldOver(threats, sight, navigationPolicy().hostile_avoidance_multiplier);
+   };
+ }
+diff --git a/src/survival/state/survival-policy.ts b/src/survival/state/survival-policy.ts
+index b2e232f..ac80c86 100644
+--- a/src/survival/state/survival-policy.ts
++++ b/src/survival/state/survival-policy.ts
+@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
+ import type { CombatPolicy } from "../policy/combat/contract.js";
+ import {
+   DEFAULT_SURVIVAL_POLICY,
++  changesSchema,
+   SURVIVAL_POLICY_PATHS,
+   describeLifetime,
+   flattenPolicyLeaves,
+@@ -15,6 +16,17 @@ import {
+   type SurvivalPolicy,
+ } from "../policy/contract.js";
+ 
++const configured = changesSchema.parse(JSON.parse(process.env.MINE_AI_BASE_POLICY ?? "{}"));
++const defaults: SurvivalPolicy = {
++  navigation: { ...DEFAULT_SURVIVAL_POLICY.navigation, ...configured.navigation },
++  combat: {
++    ...DEFAULT_SURVIVAL_POLICY.combat,
++    ...configured.combat,
++    terrain: { ...DEFAULT_SURVIVAL_POLICY.combat.terrain, ...configured.combat?.terrain },
++  },
++  food: { raw: { ...DEFAULT_SURVIVAL_POLICY.food.raw, ...configured.food?.raw } },
++};
++
+ /**
+  * One connection's survival policy: the defaults plus one override per field,
+  * each carrying its own lifetime and the model's reason for it.
+@@ -29,7 +41,7 @@ export class SurvivalPolicyState {
+   #revision = 0;
+   #nextEncounter = 0;
+   readonly #overrides = new Map<string, PolicyOverride>();
+-  #effective: SurvivalPolicy = DEFAULT_SURVIVAL_POLICY;
++  #effective: SurvivalPolicy = defaults;
+   readonly #arrowHunts = new Set<AbortSignal>();
+   readonly #quarries = new Map<AbortSignal, string>();
+   #encounter: string | null = null;
+@@ -85,7 +97,7 @@ export class SurvivalPolicyState {
+   snapshot(): PolicySnapshot {
+     return structuredClone({
+       revision: `${this.#connection}:${this.#revision}`,
+-      defaults: DEFAULT_SURVIVAL_POLICY,
++      defaults,
+       effective: this.effective,
+       overrides: [...this.#overrides.values()].sort((left, right) => left.path.localeCompare(right.path)),
+       encounter: this.#encounter,
+@@ -206,7 +218,7 @@ export class SurvivalPolicyState {
+   }
+   /** Defaults with every live override written over them; the clone is not frozen. */
+   #compose(): SurvivalPolicy {
+-    const policy = structuredClone(DEFAULT_SURVIVAL_POLICY) as SurvivalPolicy;
++    const policy = structuredClone(defaults);
+     for (const override of this.#overrides.values()) {
+       const segments = override.path.split(".");
+       let target = policy as unknown as Record<string, unknown>;

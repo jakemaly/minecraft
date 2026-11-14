@@ -1,0 +1,9 @@
+**
+!deploy/
+!deploy/Dockerfile
+!deploy/inside.mjs
+!deploy/viewer*
+!deploy/view-blocks.patch
+!deploy/build-progress.patch
+!deploy/search-budget.patch
+!deploy/primitives.patch

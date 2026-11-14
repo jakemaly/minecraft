@@ -1,0 +1,191 @@
+diff --git a/src/navigation/orchestration/navigation-run.ts b/src/navigation/orchestration/navigation-run.ts
+index 6c2fec8..a4d1909 100644
+--- a/src/navigation/orchestration/navigation-run.ts
++++ b/src/navigation/orchestration/navigation-run.ts
+@@ -748,9 +748,7 @@ export class NavigationRun {
+             update.kind === "no_path"
+               ? "frontier"
+               : update.kind === "limit"
+-                ? update.limit.kind === "radius"
+-                  ? "radius"
+-                  : "compute_time"
++                ? update.limit.kind === "search_time" ? "compute_time" : update.limit.kind
+                 : null,
+           limit: update.kind === "limit" ? update.limit : null,
+           interpretation:
+diff --git a/src/navigation/orchestration/outcome.ts b/src/navigation/orchestration/outcome.ts
+index 4670295..3955f44 100644
+--- a/src/navigation/orchestration/outcome.ts
++++ b/src/navigation/orchestration/outcome.ts
+@@ -38,7 +38,7 @@ export interface ClosestNodeEvidence {
+ }
+
+ export interface SearchLimitEvidence {
+-  readonly kind: "search_time" | "radius";
++  readonly kind: "search_time" | "radius" | "nodes";
+   readonly limit: number;
+   readonly observed: number;
+   readonly closest: ClosestNodeEvidence;
+diff --git a/src/navigation/orchestration/process-events.ts b/src/navigation/orchestration/process-events.ts
+index 7387d22..b481e51 100644
+--- a/src/navigation/orchestration/process-events.ts
++++ b/src/navigation/orchestration/process-events.ts
+@@ -44,7 +44,9 @@ export function describeCalculationFailure(failure: NavigationCalculationFailure
+       ? `no path found after ${spent}`
+       : failure.limit.kind === "search_time"
+         ? `search timed out after ${spent} (limit ${failure.limit.limit} ms); no path or usable partial route found`
+-        : `search radius limit ${failure.limit.limit} blocks reached after ${spent}; no path or usable partial route found`;
++        : failure.limit.kind === "nodes"
++          ? `search node limit ${failure.limit.limit} reached after ${spent}; no path or usable partial route found`
++          : `search radius limit ${failure.limit.limit} blocks reached after ${spent}; no path or usable partial route found`;
+   const what = `${stopped}; ${work}; ${where}`;
+   return failure.after ? `${what}, while replanning after a movement failure: ${failure.after.observation}` : what;
+ }
+diff --git a/src/navigation/search/search-result.ts b/src/navigation/search/search-result.ts
+index d2e279b..2897740 100644
+--- a/src/navigation/search/search-result.ts
++++ b/src/navigation/search/search-result.ts
+@@ -2,6 +2,8 @@
+ import type { BlockPosition } from "../world/world.js";
+
+ export interface SearchLimits {
++  /** Maximum planning states retained by one search, including the start. */
++  readonly maximumNodes?: number;
+   /**
+    * How long to keep searching once something is worth committing.
+    *
+diff --git a/src/navigation/search/search.test.ts b/src/navigation/search/search.test.ts
+index 0f4ab28..eb458b7 100644
+--- a/src/navigation/search/search.test.ts
++++ b/src/navigation/search/search.test.ts
+@@ -178,6 +178,30 @@ test("terminal work competes with travel even when it can start at the root", ()
+   assert.equal(plan.steps.length, 2);
+ });
+
++test("a node limit bounds retained states even before the compute budget is spent", () => {
++  const limits = { maximumNodes: 12, failureTimeoutMs: 5000 };
++  const wide = searchOver(
++    goalOf("unreachable", () => 0),
++    stubCatalogue((state) => Array.from({ length: 40 }, (_, index) => graphMovement(state, 1, index, 1))),
++    { limits },
++  );
++  const stopped = wide.advance();
++  assert.equal(stopped.kind, "limit");
++  if (stopped.kind !== "limit") return;
++  assert.equal(stopped.limit.kind, "nodes");
++  assert.equal(stopped.evidence.generated, limits.maximumNodes);
++  assert.equal(stopped.evidence.computeMs, 0);
++
++  const line = searchOver(
++    goalOf("distant", (node) => 40 - node.feet.x, (node) => node.feet.x === 40),
++    stubCatalogue((state) => state.node.feet.x < 40 ? [graphMovement(state, state.node.feet.x + 1, 0, 1)] : []),
++    { limits },
++  );
++  const prefix = expect(line.advance(), "segment_ready");
++  assert.equal(prefix.evidence.generated, limits.maximumNodes);
++  assert.equal(prefix.plan.end.x, 11);
++});
++
+ test("incremental A* finds the lowest-cost flat route without mutating its plan", () => {
+   const search = searchOver(destination({ x: 3, y: 63, z: 0 }), createMovementCatalogue(), { id: "search" });
+
+diff --git a/src/navigation/search/search.ts b/src/navigation/search/search.ts
+index 68e6fcf..68f0854 100644
+--- a/src/navigation/search/search.ts
++++ b/src/navigation/search/search.ts
+@@ -65,6 +65,10 @@ export interface PlanningBudget {
+ /** A node index that names no node: the root has no parent, and a search may have no goal node yet. */
+ const NO_NODE = -1;
+
++// Fast searches can retain a large graph before the compute deadline. Leave
++// room for a foreground search and plan-ahead work in the same runtime.
++const MAXIMUM_SEARCH_NODES = 48_000;
++
+ const PROGRESS_COEFFICIENTS = [1.5, 2, 2.5, 3, 4, 5, 10] as const;
+ /**
+  * How far a partial route must carry the bot before it is worth committing.
+@@ -342,6 +346,7 @@ function attemptSegment(
+ export class IncrementalSearch {
+   readonly #options: SearchOptions;
+   readonly #now: () => number;
++  readonly #maximumNodes: number;
+   /** The goal with its heuristic scaled by the policy's weight; nothing reads `options.goal` after construction. */
+   readonly #goal: SearchOptions["goal"];
+   readonly #store = new NodeStore();
+@@ -367,6 +372,7 @@ export class IncrementalSearch {
+   constructor(options: SearchOptions) {
+     this.#options = options;
+     this.#now = options.now ?? performance.now.bind(performance);
++    this.#maximumNodes = Math.max(1, Math.min(MAXIMUM_SEARCH_NODES, options.limits?.maximumNodes ?? MAXIMUM_SEARCH_NODES));
+     // Goals report ticks, the same unit as costs, so nothing is converted here.
+     // They used to report blocks and be scaled by the cheapest per-block edge,
+     // which is admissible and far too weak: the cheapest edge is a deep drop at
+@@ -489,11 +495,11 @@ export class IncrementalSearch {
+    * budget applies while nothing is. The radius clips the frontier separately.
+    */
+   #limitReached(): SearchUpdate | undefined {
++    const nodeLimit = this.#store.length >= this.#maximumNodes;
+     const limits = this.#options.limits;
+-    if (!limits) return undefined;
+     const spent = this.#computeMs + (this.#now() - this.#slice.began);
+-    const primary = limits.primaryTimeoutMs;
+-    if (this.#candidates.hasTravelled && primary !== undefined && spent >= primary) {
++    const primary = limits?.primaryTimeoutMs;
++    if (!nodeLimit && this.#candidates.hasTravelled && primary !== undefined && spent >= primary) {
+       const selection = this.#candidates.select(this.#bestGoal, this.#closest);
+       const attempt = attemptSegment(this.#options, this.#store, selection, this.#visited);
+       if (attempt.kind === "segment") {
+@@ -510,13 +516,13 @@ export class IncrementalSearch {
+         this.#slice.checkpoint = this.#partialRouteCheckpoint(primary, selection, "no_progress_candidate");
+       }
+     }
+-    const failure = limits.failureTimeoutMs;
+-    if (failure !== undefined && spent >= failure) {
++    const failure = limits?.failureTimeoutMs ?? Infinity;
++    if (nodeLimit || spent >= failure) {
+       const selection = this.#candidates.select(this.#bestGoal, this.#closest);
+       const attempt = attemptSegment(this.#options, this.#store, selection, this.#visited);
+       if (attempt.kind === "stale") return this.#finish(() => ({ kind: "stale", evidence: this.#evidence() }));
+       const checkpoint = this.#partialRouteCheckpoint(
+-        failure,
++        nodeLimit ? this.#maximumNodes : failure,
+         selection,
+         attempt.kind === "segment" ? "segment_ready" : "no_progress_candidate",
+       );
+@@ -530,7 +536,9 @@ export class IncrementalSearch {
+       }
+       return this.#finish(() => ({
+         kind: "limit",
+-        limit: { kind: "search_time", limit: failure, observed: Math.round(spent), closest: this.#closestEvidence() },
++        limit: nodeLimit
++          ? { kind: "nodes", limit: this.#maximumNodes, observed: this.#store.length, closest: this.#closestEvidence() }
++          : { kind: "search_time", limit: failure, observed: Math.round(spent), closest: this.#closestEvidence() },
+         evidence: this.#evidence(),
+         checkpoint,
+       }));
+@@ -588,10 +596,11 @@ export class IncrementalSearch {
+       this.#open.push(terminal);
+       this.#generated += 1;
+     }
++    if (store.length >= this.#maximumNodes) return;
+     // The catalogue's rows are read by index, and a movement is only made for
+     // a row that improves on a known arrival; about half of them do not.
+     const movements = context.catalogue.generate(state, context, digContext);
+-    for (let index = 0; index < movements.length; index += 1) {
++    for (let index = 0; index < movements.length && store.length < this.#maximumNodes; index += 1) {
+       const x = movements.toX[index]!;
+       const y = movements.toY[index]!;
+       const z = movements.toZ[index]!;
+diff --git a/src/navigation/telemetry/index.ts b/src/navigation/telemetry/index.ts
+index f2afb19..a3ad1dc 100644
+--- a/src/navigation/telemetry/index.ts
++++ b/src/navigation/telemetry/index.ts
+@@ -12,7 +12,7 @@ export type NavigationEvent =
+   | { readonly kind: "dive"; readonly runId: string; readonly atMs: number; readonly state: "breathing" | "resumed" | "released" }
+   | { readonly kind: "search_finished"; readonly runId: string; readonly searchId: string; readonly atMs: number;
+       readonly goal: string; readonly result: "complete" | "segment_ready" | "no_path" | "limit" | "stale" | "cancelled";
+-      readonly counts: SearchEvidence; readonly exhausted: "frontier" | "compute_time" | "radius" | null;
++      readonly counts: SearchEvidence; readonly exhausted: "frontier" | "compute_time" | "radius" | "nodes" | null;
+       readonly limit: SearchLimitEvidence | null;
+       readonly interpretation: string }
+   | { readonly kind: "run_started"; readonly runId: string; readonly atMs: number }

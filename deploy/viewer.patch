@@ -1,0 +1,17 @@
+diff --git a/src/server/runtime-host.ts b/src/server/runtime-host.ts
+--- a/src/server/runtime-host.ts
++++ b/src/server/runtime-host.ts
+@@ -1,4 +1,5 @@
+ /** Connect one Mineflayer bot and host the Mine AI MCP server. */
++import { attachViewer } from "/opt/viewer/viewer.mjs";
+ import { createMinecraftMcpHttpApplication } from "./http.js";
+ import { attachHighlighter } from "@aibengineering/minecraft-block-highlighter";
+ import mineflayer, { type Bot } from "mineflayer";
+@@ -130,6 +131,7 @@
+ export async function startRuntimeHost(source: SourceIdentity, configuration: HostOptions): Promise<RuntimeHost> {
+   await using resources = new AsyncDisposableStack();
+   const { bot, identity } = resources.use(await connectBot(configuration));
++  resources.defer(attachViewer(bot));
+   let connected = true;
+   let running = false;
+   let connectionFailure: Error | null = null;

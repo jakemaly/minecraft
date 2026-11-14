@@ -1,0 +1,8 @@
+{
+  "name": "minecraft-observer",
+  "private": true,
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.13",
+    "prismarine-viewer": "1.33.0"
+  }
+}
